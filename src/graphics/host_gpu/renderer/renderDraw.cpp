@@ -872,11 +872,13 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	m_context.GetImageHeap().BeginDraw();
 	m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state);
 	if (state.unavailable) {
+		CountUnissuedDraw();
 		return false;
 	}
 	// Vertex programs beyond the host mesh limits or with unsupported call targets are not
 	// compiled.
 	if (state.vertex_info[0].stage.program == nullptr) {
+		CountUnissuedDraw();
 		return false;
 	}
 	// An empty screen scissor rasterizes nothing in any viewport, so only vertex-stage buffer
@@ -924,6 +926,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
 		LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
 		                   draw.index_count, 0);
+		CountUnissuedDraw();
 		return false;
 	}
 
@@ -1126,7 +1129,8 @@ static bool StageWritesMemory(const ShaderStageRuntime& stage) {
 
 // What decides whether the draw may be skipped while its pipeline is built (PendingDrawBlocker).
 static PendingDrawDescription DescribePendingDraw(const DrawRenderState&                 state,
-                                                  std::span<const ShaderVertexInputInfo> stages) {
+                                                  std::span<const ShaderVertexInputInfo> stages,
+                                                  const OcclusionQueries&                queries) {
 	PendingDrawDescription draw {.skip_enabled = true};
 	// (A pixel shader's own buffers and storage images: see g_skip_pixel_writes.)
 	const auto& pixel = state.ps_input_info.stage;
@@ -1136,8 +1140,11 @@ static PendingDrawDescription DescribePendingDraw(const DrawRenderState&        
 	    (state.ps_active &&
 	     (StageWritesRawMemory(pixel) ||
 	      (StageWritesResources(pixel) && !g_skip_pixel_writes.On())));
-	// Guest occlusion queries do not count host samples yet: ZPASS_DONE publishes synthetic
-	// always-visible results, which a skipped draw cannot change.
+	// A draw inside a guest occlusion query is not held back for its pipeline (the Saros fork
+	// waits there, which stops the GPU thread for the build, and this branch also leaves a draw
+	// out while its stage programs are translated): where it is left out it counts one sample
+	// (CountUnissuedDraw), so its object reads as visible until the draw can run.
+	(void)queries;
 	draw.query_active = false;
 	draw.linear_color_target =
 	    std::ranges::any_of(std::span {state.color_info, state.color_count},
@@ -1150,12 +1157,17 @@ static PendingDrawDescription DescribePendingDraw(const DrawRenderState&        
 	return draw;
 }
 
+void RenderExecutor::CountUnissuedDraw() {
+	m_context.GetOcclusionQueries().CountUnissuedDraw();
+}
+
 void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
                                          DrawRenderState& state, const DrawEmitInfo& emit,
                                          const DrawIndexBufferSource& index_source) {
 	auto&      ucfg                     = buffer.GetUserConfig();
 	const bool primitive_restart_enable = state.primitive_restart_enable;
 	if (CopyDepthToColor(buffer, draw, emit, state)) {
+		CountUnissuedDraw();
 		return;
 	}
 	const auto  vertex_stages = state.VertexStages();
@@ -1202,10 +1214,12 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	auto&                    pipeline_cache = m_context.GetPipelineCache();
 	PipelineCache::Pipeline* found_pipeline = nullptr;
 	if (pipeline_cache.SkipPendingDrawsEnabled()) {
-		const auto blocker = PendingDrawSkipBlocker(DescribePendingDraw(state, vertex_stages));
+		const auto blocker = PendingDrawSkipBlocker(
+		    DescribePendingDraw(state, vertex_stages, m_context.GetOcclusionQueries()));
 		found_pipeline     = pipeline_cache.FindGraphicsPipeline(buffer, state, blocker);
 		if (found_pipeline == nullptr) {
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawsSkippedPending);
+			CountUnissuedDraw();
 			return;
 		}
 	}
@@ -1435,11 +1449,13 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 
 	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
 	    ResolveColorTargets(buffer)) {
+		CountUnissuedDraw();
 		ResetBindings();
 		return true;
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
+		CountUnissuedDraw();
 		return true;
 	}
 
@@ -1467,6 +1483,7 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 	DrawRenderState state {.indirect_offsets = args.indirect.offsets,
 	                       .indirect_draw    = args.indirect.address != 0};
 	if (!GetDrawTopology(ucfg, state.topology)) {
+		CountUnissuedDraw();
 		return true;
 	}
 
@@ -1527,11 +1544,13 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 
 	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
 	    ResolveColorTargets(buffer)) {
+		CountUnissuedDraw();
 		ResetBindings();
 		return true;
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
+		CountUnissuedDraw();
 		return true;
 	}
 
@@ -1557,6 +1576,7 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 	DrawRenderState state {.indirect_offsets = args.indirect.offsets,
 	                       .indirect_draw    = args.indirect.address != 0};
 	if (!GetDrawTopology(ucfg, state.topology)) {
+		CountUnissuedDraw();
 		ResetBindings();
 		return true;
 	}
@@ -1575,6 +1595,7 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 			     state.ps_input_info.input_num, sh_ctx.GetPs().ps_regs.data_addr,
 			     sh_ctx.GetVs().es_regs.data_addr, sh_ctx.GetVs().gs_regs.data_addr);
 		}
+		CountUnissuedDraw();
 		ResetBindings();
 		return true;
 	}
@@ -1641,12 +1662,14 @@ DrawIndirectResult RenderExecutor::DrawIndirect(CommandBuffer&            buffer
 	m_context.GetCommandScheduler().PopPendingOperations();
 	Common::LockGuard lock(m_context.GetMutex());
 	if (!DrawHasValidVertexShader(sh_ctx)) {
+		CountUnissuedDraw();
 		return DrawIndirectResult::Done;
 	}
 	uc_check(ucfg);
 	hw_check(buffer);
 	DrawRenderState state {};
 	if (!GetDrawTopology(ucfg, state.topology)) {
+		CountUnissuedDraw();
 		ResetBindings();
 		return DrawIndirectResult::Done;
 	}
@@ -1706,6 +1729,7 @@ DrawIndirectResult RenderExecutor::DrawIndirect(CommandBuffer&            buffer
 	}
 	if (!args.indexed && Prospero::IsRectList(ucfg.GetPrimType()) && vertex.buffers_num == 0 &&
 	    program.param_export_mask == 0 && state.ps_input_info.input_num != 0) {
+		CountUnissuedDraw();
 		ResetBindings();
 		return DrawIndirectResult::Done;
 	}

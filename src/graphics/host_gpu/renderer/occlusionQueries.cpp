@@ -45,7 +45,7 @@ OcclusionQueries::~OcclusionQueries() {
 
 int32_t OcclusionQueries::BeginQuery(vk::CommandBuffer command) {
 	if (m_begun - m_read.load(std::memory_order_acquire) == QUERY_COUNT) {
-		m_uncounted++;
+		m_ledger.Credit();
 		return -1;
 	}
 	const auto query = static_cast<uint32_t>(m_begun++ % QUERY_COUNT);
@@ -54,13 +54,7 @@ int32_t OcclusionQueries::BeginQuery(vk::CommandBuffer command) {
 }
 
 void OcclusionQueries::Dump(uint64_t address) {
-	// Begins dump to the results, ends 8 bytes into them.
-	if ((address & 8u) == 0) {
-		m_open++;
-	} else if (m_open != 0) {
-		m_open--;
-	}
-	m_dumps.push_back({address, m_begun, m_uncounted});
+	m_dumps.push_back(m_ledger.Record(address, m_begun));
 }
 
 void OcclusionQueries::PublishDumps(bool now) {
