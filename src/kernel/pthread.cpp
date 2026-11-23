@@ -13,6 +13,7 @@
 #include "kernel/memory.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
+#include "loader/guestFaultHistory.h"
 #include "loader/runtimeLinker.h"
 
 #include <algorithm>
@@ -1019,6 +1020,7 @@ void PthreadInitSelfForMainThread() {
 #endif
 	g_pthread_self->host_thread_id = os_thread_id;
 	g_pthread_main                 = g_pthread_self;
+	Loader::GuestThreads().Add(os_thread_id, g_pthread_self->name);
 
 	LOGF("\tPthread main self: id = %d, os_thread_id = %" PRIu64 ", stack_addr = 0x%016" PRIx64
 	     ", stack_size = %" PRIu64 "\n",
@@ -3231,6 +3233,8 @@ static void CancelGuestEntry(void* /*arg*/) {
 static void CleanupThread(void* arg) {
 	auto* thread = static_cast<Pthread>(arg);
 
+	Loader::GuestThreads().Remove(thread->host_thread_id);
+
 	LibcInternalExt::RunThreadAtexitDestructors();
 
 	auto thread_dtors = g_pthread_context->GetThreadDtors();
@@ -3270,6 +3274,7 @@ static void* RunThread(void* arg) {
 	os_thread_id = GetHostThreadId();
 #endif
 	thread->host_thread_id = os_thread_id;
+	Loader::GuestThreads().Add(os_thread_id, thread->name);
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	if (!thread->name.empty()) {
 #if defined(__APPLE__)
@@ -3657,6 +3662,7 @@ int KYTY_SYSV_ABI PthreadRename(Pthread thread, const char* name) {
 	}
 
 	thread->name = std::string(name);
+	Loader::GuestThreads().Rename(thread->host_thread_id, thread->name);
 
 	return OK;
 }
