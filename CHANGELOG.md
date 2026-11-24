@@ -76,6 +76,42 @@ with them; other places and machines will differ.
   right after a fast turn, miss nothing. Not judged by eye in motion. That fork turned its own
   queries off by default: they cost half the frame rate in the heaviest levels of another game.
 
+### Smoother frames
+
+- **A frame is shown when it is done, not at the next tick of a 60 Hz clock** (after the
+  Demon's Souls fork's `KYTY_VRR`; the Jetsku and the Ghost of Yōtei forks do the same). A
+  finished frame used to wait for the emulator's next vblank, so a game that renders 50 frames
+  a second showed each one for 16.7 ms or 33.3 ms by turns. It now goes to the screen the
+  moment the GPU has finished it, at most once per vblank period; the game's own vblank clock
+  is untouched. Saros at a heavy spot with DLSS and frame generation, switched off and on twice
+  in one session: the same 50 fps, frame times 16.6 ms (median) and 33.7 ms (95th percentile)
+  before, 19.0 and 24.3 ms after; how much a frame's time differs from the one before it
+  (90th percentile) 17.2 to 5.4 ms; the 1% low 19–24 to 27–28 fps. `KYTY_FLIP_WHEN_DONE=0` in
+  the launcher's Environment field gives the old behaviour.
+- **A slow frame every eighth frame at heavy spots is gone.** Every eighth frame Saros's render
+  thread reads back 4 to 4.6 MiB the GPU wrote a moment before, from one of five buffers in
+  turn. The emulator has a set of "hot" pages for this: memory the game read back once is
+  copied out with the GPU work that writes it next, so the game finds it ready. The set forgot
+  these pages before their buffer came round again and took only half of each read, so the
+  thread fetched the bytes in nine round trips, 10 to 15 ms, and the frame took 30 to 38 ms
+  instead of 19: about one and a half hitches a second while standing still. The set now holds
+  eight times as many pages and whole reads. Off and on twice in one session: the slowest 1%
+  of frames 35.9 ms to 22.0 and 23.2 ms, the longest frame 40 and 76 ms to 24 and 26 ms, the
+  1% low 24–27 to 42–44 fps (`hot_pages_max`, `hot_window`).
+- **Loading while you move holds the game's threads up less.** While a level streams in, the
+  game's loading threads overwrite memory the GPU wrote earlier, thousands of pages in a row,
+  and every page was fetched back from video memory by itself first (0.05 to 0.26 ms each, 50
+  to 250 ms for a burst, with the GPU thread out of work meanwhile). A thread that walks
+  through such pages now gets them a growing window at a time, and a read that runs on
+  through a buffer gets larger pieces. A cycle restarted from the pause menu and the walk
+  after it, one run each way: 52 to 40 slow frames, 3.3 to 2.7 s lost to them, the game's
+  threads held 3.4 to 1.8 s by these fetches (`store_ahead`, `readback_ahead`).
+- **Memory the game frees no longer stops the GPU thread until the GPU has finished
+  everything** (the Demon's Souls and the Ghost of Yōtei forks found the same). An unmap of
+  memory a cache knows waited for all GPU work in flight: 4 to 7 ms each time, in half of the
+  ten-second windows of a session played through the game. It now waits only for what would
+  still write into that memory (`unmap_precise`; 0 gives the old wait).
+
 ### Shaders compiled before play instead of during it
 
 - **Precompile pass** (`run-windows.ps1 -Precompile`, or the launcher's button): builds everything
@@ -402,7 +438,8 @@ unmodified `saros` branch gave 37 fps and the first batch of changes below 47.9.
 Most of the changes above can be turned off while the game runs, through the live channel below:
 `vulkan_recording`, `bda_lazy`, `stream_share`, `heap_by_content`, `lookahead_replan`,
 `guest_image_writes`, `image_buffer_writes`, `guest_copy`, `readback_narrow`, `gpu_scalars`,
-`fault_ahead`, `game_upscaler`, `game_upscaler_skip`. Each also reads an environment variable `KYTY_<NAME>` at
+`fault_ahead`, `game_upscaler`, `game_upscaler_skip`, `flip_when_done`, `hot_window`,
+`hot_pages_max`, `store_ahead`, `readback_ahead`, `unmap_precise`. Each also reads an environment variable `KYTY_<NAME>` at
 start. `present_crop` 1 to 9 shows a part of the picture pixel for pixel in the window.
 
 ## Tools for measuring
@@ -418,6 +455,24 @@ start. `present_crop` 1 to 9 shows a part of the picture pixel for pixel in the 
   `Perf <time of day> ...` line with the numbers of `measure` into the log, so a session played
   through any part of the game says afterwards where it was slow and whether the CPU or the GPU
   was the limit there. Windows without a frame (loading) are left out.
+- **A hitch log** (`KYTY_HITCH_LOG_MS=<milliseconds>`, for example `KYTY_HITCH_LOG_MS=30` in
+  the launcher's Environment field; the Demon's Souls, Jetsku and Ghost of Yōtei forks each
+  have such a log). `measure` and the performance log average over seconds, in which one frame
+  of 80 ms among 500 does not show. With this, every frame that stayed on screen at least that
+  long, and half as long again as the frames before it, writes one `Hitch <time of day> ...`
+  line: the frame's time beside the usual one, then, as `this(usual)`, the GPU thread's busy
+  time, its waits by reason, and whatever else lies far above a usual frame: shaders and
+  pipelines built, uploads, evictions, the CPU time of every emulator thread and of every one
+  of the game's threads by name. `| held ...` lists what the emulator made the game's threads
+  wait for in that frame (fetching GPU-written memory back for a read or a store, an unmap, a
+  slow write fault), by thread, with the longest wait and its address. It found the two
+  causes above: frames in which the GPU thread sits idle because a game thread is held.
+  `measure` also reports `step_ms`, how much a frame's time differs from the one before it,
+  and the pages the hot set delivers a frame (`async_pages`).
+- `readback_log` (live switch, for a few seconds) writes a line for every readback a game
+  thread's read asks for and for every store of the GPU thread into GPU-written pages;
+  `stale_readable 0` with the counter `early_reads` counts reads that arrive before the
+  delivered bytes are in place.
 - **The GPU's time by shader** (live switch `gpu_prof`; the idea of the Jetsku fork's operation
   profiler). While it is on, a timestamp is recorded before and after every guest dispatch and
   render pass instance, and turning it off writes `GpuProf` lines into the log: the GPU's time a
