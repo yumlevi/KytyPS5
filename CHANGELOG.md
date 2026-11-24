@@ -106,6 +106,22 @@ with them; other places and machines will differ.
   through a buffer gets larger pieces. A cycle restarted from the pause menu and the walk
   after it, one run each way: 52 to 40 slow frames, 3.3 to 2.7 s lost to them, the game's
   threads held 3.4 to 1.8 s by these fetches (`store_ahead`, `readback_ahead`).
+- **Bytes fetched back from video memory no longer land on newer data.** Three parts of the
+  emulator write such bytes into the game's memory (the GPU thread's own fetch, a game
+  thread's copy of a fetch handed to it, and the background delivery of the pages the game
+  reads every frame), and they did not agree on which of them owned a page: two of them
+  marked neighbouring pages as delivered that they had no bytes for, and the third wrote its
+  bytes without looking whether the page was still waiting for them. A page could so be
+  written by the game and then have the GPU's old bytes put over it: a block of a streamed
+  texture or mesh with old data in it, or a count that a compute shader then looped on
+  without end (the GPU at 100%, the picture frozen, at times ending as a lost graphics
+  device with no fault address; one start of about fifteen into a new cycle showed that).
+  The race is older than this branch's work on it; the growing windows above made it
+  likelier, which is how a review of them found it. Each of the three now delivers and marks
+  only the pages it holds bytes for, and only while a page still waits for them. The pages
+  ahead of a store are fetched by the storing thread's own copy alone, at most 63 at a time
+  (256 before), which gives back part of the gain above: 66 slow frames in the same restart
+  and walk.
 - **Memory the game frees no longer stops the GPU thread until the GPU has finished
   everything** (the Demon's Souls and the Ghost of Yōtei forks found the same). An unmap of
   memory a cache knows waited for all GPU work in flight: 4 to 7 ms each time, in half of the
