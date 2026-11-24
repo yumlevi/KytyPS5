@@ -189,6 +189,21 @@ with them; other places and machines will differ.
 
 ### Crashes and memory
 
+- **The game no longer reads old bytes from memory the GPU has written.** A page the game reads
+  back every frame stays readable while the GPU writes it, and its new bytes are copied back
+  when the submission completes. Four paths let the game read the bytes of before the work
+  after it had been told the work was done; in Saros a worker thread took an index from such a
+  record and crashed the game (an access violation in the game's code, in 3 of 8 test runs of a
+  level within a minute):
+  - the mark that keeps a page readable stayed behind on neighbouring pages (since the
+    publication fix of 2026-11-24 a copy-back cleans only the pages it holds bytes for), and a
+    later GPU write of such a page left it readable with its old bytes for good;
+  - the game's own "done" markers for a submission (its labels, the flip, a suspend point) were
+    queued before that submission's copy-back and so were delivered first. The copy-back now
+    runs before anything else queued for its submission (`publish_first 0` is the old order);
+  - a readback that took over such a page's bytes delivered them behind the labels while the
+    page stayed readable; and a page written twice in a row stayed readable for a moment after
+    the first write's bytes had been given up.
 - **Eight fixes of the Saros fork's `saros-v0.1.8` to `saros-v0.1.12` are taken over** (its author
   in turn took our lazy buffer synchronisation, the white flash fix and the readback work). Each
   is its own commit with his text:
@@ -509,6 +524,28 @@ start. `present_crop` 1 to 9 shows a part of the picture pixel for pixel in the 
   and, two seconds later, `MarkPerf #<n>` with the numbers of `measure` for those two seconds.
   For saying afterwards where in a long log something was seen on the screen (a wrong picture
   has no line of its own). A key mapping that uses F9 keeps it.
+- **A play session can be played back along its path** (`replay <log> <from> [seconds]
+  [oncamera]` on the live channel), as a benchmark of real play. A session's log already held
+  every gamepad event with its time; it now also holds the camera of every frame (`Camera:`
+  lines: position and direction, read from the game's view constants as the upscaler reads
+  them; `path_log 0` leaves them out). Played back by the clock alone the game leaves the
+  session's course within seconds, because a stick sampled one frame later turns the camera a
+  few degrees further. So the replay corrects the sticks towards the recorded path: it turns the
+  camera to where it looked and walks the player to where they stood, slows or speeds the
+  session's clock a little for a player who is behind or ahead, and, where the player has left
+  the path and stands on another part of it, goes on from that part. `Replay track:` lines say
+  every second how far off the path it is, and the end line until when it kept to it. On a test
+  path of 76 seconds with a drop off a ledge it stayed within 1 to 35 units and 1.5 degrees
+  while running and on the path for 66 to 76 seconds; a player's session of 137 seconds
+  (running, jumps, a fight) was followed to its end, 20 units and 0.6 degrees off on average,
+  with the frame rate of every ten seconds within a few percent of the session's own. What it
+  cannot repeat is a fight: the enemies do not do the same thing twice. The camera is read
+  where the emulator's upscaler or frame generation reads it, so one of the two has to be on.
+- **What was done to the memory a crash read** (`mem_trace 1`, `KYTY_MEM_TRACE=1`): a ring keeps
+  the emulator's last 131,072 actions on memory the GPU writes (a GPU write recorded, a page
+  left readable or taken from the game, bytes copied back and by which way, faults, labels and
+  flips delivered), and a fatal report lists them for the memory each register points to, with
+  their times against the fault. For a game thread that crashed on a value it read too early.
 - `readback_log` (live switch, for a few seconds) writes a line for every readback a game
   thread's read asks for and for every store of the GPU thread into GPU-written pages;
   `stale_readable 0` with the counter `early_reads` counts reads that arrive before the
