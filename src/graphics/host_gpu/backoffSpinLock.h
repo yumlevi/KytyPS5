@@ -15,7 +15,8 @@
 namespace Libs::Graphics {
 
 // 1: a thread that finds a page tracking lock taken spins a little and then sleeps on the lock
-// word until the holder lets go; 0: it spins until then, as before.
+// word until the holder lets go, except the GPU thread, which spins on; 2: the GPU thread
+// sleeps too; 0: every thread spins until then, as before.
 inline Common::LiveControl::Switch g_lock_sleep("lock_sleep", 1);
 
 // The lock of a tracking region and of a page manager region. It is held for a few hundred
@@ -28,6 +29,13 @@ inline Common::LiveControl::Switch g_lock_sleep("lock_sleep", 1);
 // after a spin for the same reason). After a few microseconds of spinning the waiter sleeps on
 // the lock word; a release wakes one sleeper when there is any, which costs a release without
 // sleepers one load.
+//
+// The GPU thread spins on. A sleeper that is woken and finds the lock taken again sleeps again
+// without a spin (atomic_flag::wait returns only once it has seen the flag clear), so a thread
+// that lets go and takes the lock again at once, as a publication of downloads does page by
+// page and a guest thread's copy of GPU-written bytes for up to two milliseconds, keeps a
+// sleeper out until it is done. A spinner gets in at the first gap, and the frame waits for
+// this one thread.
 class BackoffSpinLock final {
 public:
 	void lock() noexcept {
@@ -35,7 +43,12 @@ public:
 		while (m_flag.test_and_set(std::memory_order_acquire)) {
 			// Wait on reads, so the holder's cache line is not written until the lock is free.
 			while (m_flag.test(std::memory_order_relaxed)) {
-				if (++spins < Spins || !g_lock_sleep.On()) {
+				if (++spins < Spins) {
+					Pause();
+					continue;
+				}
+				if (const auto mode = g_lock_sleep.Get();
+				    mode == 0 || (mode == 1 && Common::LiveControl::OnGpuThread())) {
 					Pause();
 					continue;
 				}

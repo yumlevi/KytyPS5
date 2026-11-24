@@ -115,7 +115,9 @@ with them; other places and machines will differ.
   forks). While a level streams in, a dozen of the game's threads wait for these locks at
   once; each burnt a whole CPU for as long as it waited, 35 to 45 ms a thread in one slow
   frame. The same restart and walk, one run each way: 67 to 49 slow frames, a quarter less CPU
-  time in them (`lock_sleep`).
+  time in them (`lock_sleep`). The thread that feeds the GPU spins on as before: a sleeper
+  gets in only once a thread that takes the lock again and again is done, a spinner at the
+  first gap, and the frame waits for that one thread (`lock_sleep 2` lets it sleep too).
 - Walking the same route round Saros's hub with the build before these changes and after
   them (frame generation and DLSS on, about 40 fps both times): frame times 17 ms (median),
   33.9 ms (95th percentile) and 50 ms (99th) before; 24 ms, 25–30 ms and 26–43 ms after.
