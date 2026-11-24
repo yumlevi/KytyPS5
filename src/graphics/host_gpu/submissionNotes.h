@@ -37,7 +37,9 @@ struct Note {
 	}
 };
 
-inline constexpr size_t Kept = 64;
+// (A GPU that stops answering is noticed seconds later, and the GPU thread goes on submitting
+// until it has to wait for it: more than a frame's submissions, a hundred on Saros.)
+inline constexpr size_t Kept = 256;
 
 inline std::mutex             g_mutex;
 inline std::array<Note, Kept> g_notes {};

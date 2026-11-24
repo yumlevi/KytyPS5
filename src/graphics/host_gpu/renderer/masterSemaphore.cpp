@@ -44,7 +44,7 @@ void MasterSemaphore::Failed(const char* call, vk::Result result, uint64_t tick)
 	// A lost device usually ends here: name the result and the memory state for the report.
 	m_graphics.LogMemoryBudget();
 	if (result == vk::Result::eErrorDeviceLost) {
-		m_graphics.LogLostDevice();
+		m_graphics.LogLostDevice(m_gpu_tick.load(std::memory_order_relaxed));
 	}
 	EXIT("%s failed: %s (waiting for tick %" PRIu64 ", GPU at %" PRIu64 ")\n", call,
 	     vk::to_string(result).c_str(), tick, m_gpu_tick.load(std::memory_order_relaxed));

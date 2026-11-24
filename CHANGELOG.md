@@ -269,6 +269,13 @@ with them; other places and machines will differ.
   read at about the same low address that is in none of the emulator's buffers, during the
   load or at the arrival in the level; none of those starts had this record yet, and the cause
   is not known.
+- **The record now lists every submission the GPU had not finished**, not the newest twelve. A
+  GPU that stops answering stopped in the first of them, and the GPU thread goes on submitting
+  for a while before it has to wait: in the first such record here (no fault address, ten
+  seconds after the arrival in a new cycle, frame generation on) the GPU had finished
+  submission 45253 and the twelve listed began at 45257. The last 256 submissions are kept,
+  and the record is written once where several threads fail on the same loss (it was written
+  twice, the lines of both mixed).
 - **A start that dies inside a driver says where.** A player's log of a start with frame
   generation ended in the middle of the Vulkan device's creation, without an error: the
   process had crashed inside a library that is not the emulator's, before the emulator's crash

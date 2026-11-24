@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cinttypes>
 #include <fmt/format.h>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -282,10 +283,19 @@ void GraphicContext::LogMemoryBudget() const {
 // What a report of a lost device needs and the driver knows: how full the memory was, and with
 // VK_EXT_device_fault whether the GPU faulted on an address (and which) or stopped answering.
 // To the console as well: a launcher's log holds only that.
-void GraphicContext::LogLostDevice() const {
+void GraphicContext::LogLostDevice(uint64_t gpu_tick) const {
 	if (device == nullptr) {
 		return;
 	}
+	// One record: the threads that wait for the GPU all fail on a lost device, and each comes
+	// here before it ends the process. A later one waits for the record and adds nothing.
+	static std::mutex mutex;
+	static bool       written = false;
+	std::lock_guard   lock(mutex);
+	if (written) {
+		return;
+	}
+	written = true;
 	using MemoryBudget::MiB;
 	if (const auto heaps = SampleMemoryHeaps(); heaps.device.budget != 0) {
 		Log::WriteToConsoleAndLog(fmt::format(
@@ -302,8 +312,25 @@ void GraphicContext::LogLostDevice() const {
 		    fmt::format("Lost device: the upscaler made {} picture(s), the last for tick {}\n",
 		                pictures, tick));
 	}
-	// What the last submissions held: the failing call says which of them the GPU did not finish.
-	SubmissionNotes::ForEachNewest(12, [](const SubmissionNotes::Note& note) {
+	// What the submissions held that the GPU did not finish, the first of them above all: a GPU
+	// that stopped answering stopped in that one. (Without the GPU's tick: the newest twelve.)
+	uint64_t oldest = 0;
+	SubmissionNotes::ForEachNewest(SubmissionNotes::Kept, [&oldest](const auto& note) {
+		oldest = oldest == 0 ? note.tick : oldest;
+	});
+	if (gpu_tick != 0 && oldest > gpu_tick + 1) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Lost device: the GPU finished submission {}; what {} to {} held is no longer kept\n",
+		    gpu_tick, gpu_tick + 1, oldest - 1));
+	} else if (gpu_tick != 0) {
+		Log::WriteToConsoleAndLog(
+		    fmt::format("Lost device: the GPU finished submission {}; what came after it:\n", gpu_tick));
+	}
+	SubmissionNotes::ForEachNewest(gpu_tick != 0 ? SubmissionNotes::Kept : 12,
+	                               [gpu_tick](const SubmissionNotes::Note& note) {
+		if (note.tick <= gpu_tick) {
+			return;
+		}
 		std::string shaders;
 		for (uint32_t i = 0; i < note.shader_count; i++) {
 			shaders += fmt::format("{}{:#018x}", i == 0 ? "" : ", ", note.shaders[i]);

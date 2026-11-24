@@ -144,7 +144,8 @@ struct GraphicContext {
 	void               LogMemoryBudget() const;
 	// After a call failed with a lost device: the memory state and the driver's fault record,
 	// to the console and the log.
-	void               LogLostDevice() const;
+	// `gpu_tick`: the last submission the GPU is known to have finished (0: not known).
+	void               LogLostDevice(uint64_t gpu_tick = 0) const;
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
