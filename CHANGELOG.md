@@ -111,6 +111,14 @@ with them; other places and machines will differ.
   memory a cache knows waited for all GPU work in flight: 4 to 7 ms each time, in half of the
   ten-second windows of a session played through the game. It now waits only for what would
   still write into that memory (`unmap_precise`; 0 gives the old wait).
+- **Threads waiting for a page-tracking lock sleep instead of spinning** (as in those two
+  forks). While a level streams in, a dozen of the game's threads wait for these locks at
+  once; each burnt a whole CPU for as long as it waited, 35 to 45 ms a thread in one slow
+  frame. The same restart and walk, one run each way: 67 to 49 slow frames, a quarter less CPU
+  time in them (`lock_sleep`).
+- Walking the same route round Saros's hub with the build before these changes and after
+  them (frame generation and DLSS on, about 40 fps both times): frame times 17 ms (median),
+  33.9 ms (95th percentile) and 50 ms (99th) before; 24 ms, 25–30 ms and 26–43 ms after.
 
 ### Shaders compiled before play instead of during it
 
@@ -439,7 +447,7 @@ Most of the changes above can be turned off while the game runs, through the liv
 `vulkan_recording`, `bda_lazy`, `stream_share`, `heap_by_content`, `lookahead_replan`,
 `guest_image_writes`, `image_buffer_writes`, `guest_copy`, `readback_narrow`, `gpu_scalars`,
 `fault_ahead`, `game_upscaler`, `game_upscaler_skip`, `flip_when_done`, `hot_window`,
-`hot_pages_max`, `store_ahead`, `readback_ahead`, `unmap_precise`. Each also reads an environment variable `KYTY_<NAME>` at
+`hot_pages_max`, `store_ahead`, `readback_ahead`, `unmap_precise`, `lock_sleep`. Each also reads an environment variable `KYTY_<NAME>` at
 start. `present_crop` 1 to 9 shows a part of the picture pixel for pixel in the window.
 
 ## Tools for measuring

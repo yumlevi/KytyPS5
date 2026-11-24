@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/liveControl.h"
 #include "common/virtualMemory.h"
+#include "graphics/host_gpu/backoffSpinLock.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "kernel/memory.h"
 
@@ -58,22 +59,12 @@ Common::LiveControl::Counter g_protect_pages_gpu("protect_pages_gpu");
 
 class SpinGuard final {
 public:
-	explicit SpinGuard(std::atomic_flag& lock): m_lock(lock) {
-		while (m_lock.test_and_set(std::memory_order_acquire)) {
-#if defined(__x86_64__) || defined(_M_X64)
-			_mm_pause();
-#elif defined(_M_ARM64)
-			__yield();
-#elif defined(__aarch64__)
-			asm volatile("yield");
-#endif
-		}
-	}
-	~SpinGuard() { m_lock.clear(std::memory_order_release); }
+	explicit SpinGuard(BackoffSpinLock& lock): m_lock(lock) { m_lock.lock(); }
+	~SpinGuard() { m_lock.unlock(); }
 	KYTY_CLASS_NO_COPY(SpinGuard);
 
 private:
-	std::atomic_flag& m_lock;
+	BackoffSpinLock& m_lock;
 };
 
 void ValidateRange(uint64_t vaddr, uint64_t size) {
@@ -136,7 +127,8 @@ struct PageManager::Impl {
 	static_assert(sizeof(PageState) == 2);
 
 	struct Region {
-		std::atomic_flag                    lock = ATOMIC_FLAG_INIT;
+		// Held across the protection changes of UpdateRegionWatchers (system calls).
+		BackoffSpinLock                     lock;
 		std::array<PageState, REGION_PAGES> pages;
 	};
 

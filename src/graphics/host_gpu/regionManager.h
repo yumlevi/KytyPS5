@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_REGIONMANAGER_H_
 
 #include "common/assert.h"
+#include "graphics/host_gpu/backoffSpinLock.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
@@ -32,25 +33,15 @@ class TrackingSpinLock final {
 public:
 	void lock() noexcept {
 		const auto thread = CurrentThread();
-		while (m_lock.test_and_set(std::memory_order_acquire)) {
-			EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) == thread);
-			// Wait on reads, so the holder's cache line is not written until the lock is free.
-			while (m_lock.test(std::memory_order_relaxed)) {
-#if defined(__x86_64__) || defined(_M_X64)
-				_mm_pause();
-#elif defined(_M_ARM64)
-				__yield();
-#elif defined(__aarch64__)
-				asm volatile("yield");
-#endif
-			}
-		}
+		// (Not recursive: the thread that holds it would wait for itself.)
+		EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) == thread);
+		m_lock.lock();
 		m_owner.store(thread, std::memory_order_relaxed);
 	}
 	void unlock() noexcept {
 		EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) != CurrentThread());
 		m_owner.store(0, std::memory_order_relaxed);
-		m_lock.clear(std::memory_order_release);
+		m_lock.unlock();
 	}
 
 private:
@@ -70,7 +61,7 @@ private:
 #endif
 	}
 
-	std::atomic_flag     m_lock = ATOMIC_FLAG_INIT;
+	BackoffSpinLock      m_lock;
 	std::atomic_uint32_t m_owner {0};
 };
 
