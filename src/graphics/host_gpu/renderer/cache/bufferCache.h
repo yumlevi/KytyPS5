@@ -347,8 +347,9 @@ private:
 		// Where the GPU thread may leave the rest of the request to the requester; null: it
 		// serves all of it.
 		std::shared_ptr<GuestCopy>* handoff = nullptr;
-		// A store: the bytes after its pages that are read back with them while they lie in the
-		// same buffer (StoreAhead); the whole window then belongs to the CPU.
+		// A store: the bytes after its pages that the requester's own copy reads back with them
+		// while they lie in the same buffer (StoreAhead); the pages that copy brought the bytes
+		// of then belong to the CPU. Served without such a copy, the request is its own pages.
 		uint64_t ahead = 0;
 	};
 	void RequestGuestReadback(const GuestReadback& request);

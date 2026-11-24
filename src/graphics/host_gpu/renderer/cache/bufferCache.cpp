@@ -176,10 +176,25 @@ Common::LiveControl::Counter g_fault_ahead_windows("fault_ahead_windows");
 // fault, a request to the GPU thread and a copy of 4 KiB out of video memory: 50 to 260 us a
 // page, 50 to 250 ms for a burst, in which the GPU thread runs out of work (the frames of 60
 // to 260 ms of a walk through the game). With a window that doubles along a run the same bytes
-// take a few requests, and past a quarter megabyte the GPU copies them out. A cycle restarted
-// from the pause menu and the walk after it, one run each way: 52 -> 40 slow frames, 3.3 -> 2.7 s
-// over the usual frame time, the game's threads held 3.4 -> 1.8 s by such readbacks.
-Common::LiveControl::Switch  g_store_ahead("store_ahead", 256);
+// take a few requests.
+//
+// The pages ahead are a guess, and other threads store into the same pools at the same time
+// (a dozen of them while a level streams in), so they are read back only by the requester's own
+// copy (GuestCopy), which takes each page under its region's lock and only while the page is
+// still GPU-dirty there: whoever stored into a page meanwhile has cleaned it first. The GPU
+// thread's download is not such a copy. It records the window's dirty bytes and writes them
+// into the guest's memory after its wait for the GPU, whatever happened to the pages in
+// between; for a page another thread had just been handed and had stored into, that put the
+// GPU's old bytes over the new data (streamed textures and meshes: a level that looks wrong
+// after a death, when the pools are given out again). A window that cannot be handed to the
+// requester is therefore cut back to the request's own pages, and the limit is what one copy
+// takes (guest_copy_max_kb less the request's page).
+//
+// As first written, with windows up to 256 pages that the GPU thread downloaded past a quarter
+// megabyte: a cycle restarted from the pause menu and the walk after it, one run each way,
+// 52 -> 40 slow frames, 3.3 -> 2.7 s over the usual frame time, the game's threads held
+// 3.4 -> 1.8 s by such readbacks.
+Common::LiveControl::Switch  g_store_ahead("store_ahead", 63);
 Common::LiveControl::Counter g_store_ahead_pages("store_ahead_pages");
 Common::LiveControl::Counter g_store_ahead_windows("store_ahead_windows");
 
@@ -522,9 +537,15 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
                                        std::vector<Common::UniqueFunction<void>>* batch) {
 	const CommandBuffer::ProfileGuard profile(m_scheduler.Current(),
 	                                          CommandBuffer::ProfileScope::Downloads);
+	struct Run {
+		uint64_t address;
+		uint64_t bytes;
+	};
 	std::vector<vk::BufferCopy> copies;
-	uint64_t                    total_size     = 0;
-	const auto                  buffer_address = buffer.CpuAddress();
+	// The GPU-dirty tracker pages the copies lie in, ascending like the copies.
+	std::vector<Run> runs;
+	uint64_t         total_size     = 0;
+	const auto       buffer_address = buffer.CpuAddress();
 	m_memory_tracker.ForEachDownloadRange<false>(
 	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
 		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges.Ranges(), address, bytes,
@@ -534,6 +555,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 			    // Start each packed range on its own 64-byte cache line.
 			    total_size += Common::AlignUp(end - start, 64);
 		    });
+		    runs.push_back({address, bytes});
 		    m_gpu_modified_ranges.Subtract(address, bytes);
 		    ForgetColorMetadataChecks(address, bytes);
 	    });
@@ -580,13 +602,55 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		written_begin = std::min(written_begin, buffer_address + copy.srcOffset);
 		written_end   = std::max(written_end, buffer_address + copy.srcOffset + copy.size);
 	}
-	auto publish = [total_size, buffer_address, copies = std::move(copies),
-	                download = std::move(download)] {
+	auto publish = [this, total_size, buffer_address, copies = std::move(copies),
+	                runs = std::move(runs), download = std::move(download)] {
 		download.buffer->Invalidate(download.offset, total_size);
-		for (const auto& copy: copies) {
-			Libs::LibKernel::Memory::WriteBacking(
-			    buffer_address + copy.srcOffset,
-			    download.mapped + (copy.dstOffset - download.offset), copy.size);
+		if constexpr (async) {
+			(void)this;
+			(void)runs;
+			for (const auto& copy: copies) {
+				Libs::LibKernel::Memory::WriteBacking(
+				    buffer_address + copy.srcOffset,
+				    download.mapped + (copy.dstOffset - download.offset), copy.size);
+			}
+		} else {
+			// The GPU thread's own readback: between the copies above and this publication it
+			// waited for the GPU and recorded nothing, so no GPU write is newer than these
+			// bytes. A guest thread may have been faster with a page all the same: one that
+			// was handed the page's readback before (GuestCopy) has by now published the same
+			// bytes from the mapping and gone on to store into the page. The bytes go only
+			// into pages that are GPU-dirty still, under the region's lock as that thread's
+			// copy takes it; written without the check they put the GPU's old bytes over the
+			// thread's new ones. (A few caching pages at a time: guest threads fault on the
+			// region meanwhile.)
+			constexpr uint64_t Piece = 4 * CACHING_PAGESIZE;
+			size_t             first = 0;
+			const auto         begin_of = [&](size_t i) { return buffer_address + copies[i].srcOffset; };
+			for (const auto& run: runs) {
+				for (auto piece = run.address; piece < run.address + run.bytes; piece += Piece) {
+					const auto piece_bytes = std::min(Piece, run.address + run.bytes - piece);
+					while (first < copies.size() && begin_of(first) + copies[first].size <= piece) {
+						++first;
+					}
+					m_memory_tracker.PublishGpuModified(
+					    piece, piece_bytes, [] { return true; },
+					    [&](uint64_t address, uint64_t bytes) noexcept {
+						    for (size_t i = first; i < copies.size() && begin_of(i) < address + bytes;
+						         ++i) {
+							    const auto from = std::max(address, begin_of(i));
+							    const auto to =
+							        std::min(address + bytes, begin_of(i) + copies[i].size);
+							    if (from < to) {
+								    Libs::LibKernel::Memory::WriteBacking(
+								        from,
+								        download.mapped + (copies[i].dstOffset - download.offset) +
+								            (from - begin_of(i)),
+								        to - from);
+							    }
+						    }
+					    });
+				}
+			}
 		}
 	};
 	if constexpr (async) {
@@ -863,17 +927,37 @@ void BufferCache::RequestGuestReadback(const GuestReadback& request) {
 	// bytes are GPU-dirty still): then the request is asked again, to be served whole.
 	bool again = false;
 	if (request.kind == GuestReadback::Kind::Write) {
-		// (A store with pages ahead: the whole window the copy took belongs to the CPU now, as
-		// after a fault on each of its pages.)
-		const bool wide = request.ahead != 0;
-		const auto base = wide ? copy->base : request.vaddr;
-		const auto size = wide ? copy->size : request.size;
-		m_memory_tracker.InvalidateRegion(base, size, [&] { again = true; });
+		m_memory_tracker.InvalidateRegion(request.vaddr, request.size, [&] { again = true; });
 		if (!again) {
-			if (wide) {
-				NoteStreamCopyStore(base, size);
+			QueueBdaSync(request.vaddr, request.size);
+		}
+		if (request.ahead != 0 && copy->buffer != nullptr) {
+			// A store with pages ahead: the pages this copy brought the bytes of belong to the
+			// CPU now, as after a fault on each. Only those: a page of the window the copy held
+			// nothing for is clean (and stays write-protected, another cache may watch it) or is
+			// another request's. One that is GPU-dirty again takes its own fault later.
+			const auto window_end = copy->base + copy->size;
+			uint64_t   run_begin  = 0;
+			uint64_t   run_end    = 0;
+			const auto hand_over  = [&] {
+				if (run_end > run_begin) {
+					m_memory_tracker.InvalidateRegion(run_begin, run_end - run_begin, [] {});
+					NoteStreamCopyStore(run_begin, run_end - run_begin);
+					QueueBdaSync(run_begin, run_end - run_begin);
+				}
+			};
+			for (const auto& interval: copy->intervals) {
+				const auto begin =
+				    std::max(Common::AlignDown(interval.address, TRACKER_PAGE_SIZE), copy->base);
+				const auto end = std::min(
+				    Common::AlignUp(interval.address + interval.size, TRACKER_PAGE_SIZE), window_end);
+				if (begin > run_end) {
+					hand_over();
+					run_begin = begin;
+				}
+				run_end = std::max(run_end, end);
 			}
-			QueueBdaSync(base, size);
+			hand_over();
 		}
 	} else {
 		again = m_memory_tracker.IsRegionGpuModified(
@@ -951,6 +1035,8 @@ void BufferCache::ServeGuestReadbacks(std::span<const GuestReadback> requests) {
 		DrainPublished();
 		const auto buffer_id = FindBuffer(result.base, result.size);
 		auto&      buffer    = m_slot_buffers[buffer_id];
+		// The end of the window that is a store's pages ahead (StoreAhead).
+		uint64_t ahead_bytes = 0;
 		if (IsRegionGpuModified(result.base, result.size)) {
 			// GPU-modified ranges come as many small scattered islands, so a readback widens to
 			// a window of its buffer (a fault read: the window around the faulting byte).
@@ -976,12 +1062,15 @@ void BufferCache::ServeGuestReadbacks(std::span<const GuestReadback> requests) {
 				start = std::max(Common::AlignDown(request.vaddr, TRACKER_PAGE_SIZE), start);
 				end   = std::min(Common::AlignUp(wanted_end, TRACKER_PAGE_SIZE), end);
 			}
-			if (request.kind == GuestReadback::Kind::Write && request.ahead != 0) {
+			if (request.kind == GuestReadback::Kind::Write && request.ahead != 0 &&
+			    request.handoff != nullptr) {
 				// A store that runs on through GPU-written pages: those after its own, as far
-				// as the buffer goes (StoreAhead).
+				// as the buffer goes (StoreAhead). For the requester's own copy only, see below.
+				const auto own_end = end;
 				end = std::max(end, std::min(Common::AlignUp(wanted_end, TRACKER_PAGE_SIZE) +
 				                                 request.ahead,
 				                             buffer.CpuAddress() + buffer.Size()));
+				ahead_bytes = end - own_end;
 			}
 			if (request.kind == GuestReadback::Kind::Around) {
 				// A guest thread that reads on through what the GPU wrote faults again where
@@ -1057,8 +1146,18 @@ void BufferCache::ServeGuestReadbacks(std::span<const GuestReadback> requests) {
 			     buffer.gpu_write_open ? " (open)" : "",
 			     submitted == 0 ? "none" : m_scheduler.IsFree(submitted) ? "done" : "running");
 		}
-		if (request.handoff != nullptr &&
-		    HandOffGuestCopy(request, buffer, buffer_id, result.base, result.size)) {
+		bool handed = request.handoff != nullptr &&
+		              HandOffGuestCopy(request, buffer, buffer_id, result.base, result.size);
+		if (!handed && ahead_bytes != 0) {
+			// The pages ahead of a store are a guess about memory other threads store into as
+			// well. The requester's copy takes each of them under its region's lock and only
+			// while it is GPU-dirty; nothing served here does that for bytes it would write
+			// after a wait for the GPU. Without that copy the request is its own pages, as it
+			// was before there were pages ahead.
+			result.size -= ahead_bytes;
+			handed = HandOffGuestCopy(request, buffer, buffer_id, result.base, result.size);
+		}
+		if (handed) {
 			// The requester does the rest, tracker state included, and starts now: the other
 			// requests of the batch may wait for the GPU.
 			result.skip   = true;
@@ -1100,15 +1199,10 @@ void BufferCache::ServeGuestReadbacks(std::span<const GuestReadback> requests) {
 				m_memory_tracker.UnmarkRegionAsGpuModified(result.base, result.size);
 			}
 			if (requests[i].kind == GuestReadback::Kind::Write) {
-				// (With pages ahead: the window that was read back, see RequestGuestReadback.)
-				const bool wide = requests[i].ahead != 0 && result.copied;
-				const auto base = wide ? result.base : requests[i].vaddr;
-				const auto size = wide ? result.size : requests[i].size;
-				if (wide) {
-					NoteStreamCopyStore(base, size);
-				}
-				m_memory_tracker.MarkRegionAsCpuModified(base, size);
-				QueueBdaSync(base, size);
+				// (Pages ahead of a store are handed over by the requester's own copy alone, see
+				// RequestGuestReadback.)
+				m_memory_tracker.MarkRegionAsCpuModified(requests[i].vaddr, requests[i].size);
+				QueueBdaSync(requests[i].vaddr, requests[i].size);
 			}
 		}
 		if (requests[i].done != nullptr && !result.handed) {
@@ -1305,23 +1399,55 @@ void BufferCache::RunGuestCopy(GuestCopy& copy) {
 			if (next == intervals.size() || intervals[next].address >= chunk_end) {
 				continue;
 			}
-			m_memory_tracker.PublishGpuModified(
-			    chunk, chunk_end - chunk,
-			    [&] { return copy.current.load(std::memory_order_acquire); },
-			    [&](uint64_t address, uint64_t bytes) noexcept {
-				    for (size_t i = next;
-				         i < intervals.size() && intervals[i].address < address + bytes; ++i) {
-					    const auto from = std::max(address, intervals[i].address);
-					    const auto to   = std::min(address + bytes,
-					                               intervals[i].address + intervals[i].size);
-					    if (from < to) {
-						    copy.buffer->ReadMapped(from - copy.buffer_address, to - from,
-						                            scratch.data());
-						    Libs::LibKernel::Memory::WriteBacking(from, scratch.data(), to - from);
+			// Of the chunk, the runs of pages this copy holds bytes for, and no other page. A
+			// page that is GPU-dirty in the tracker and has no bytes here is another request's:
+			// the GPU thread recorded a download of it before this copy was handed over (its
+			// byte ranges left the set then) and publishes it after its wait for the GPU.
+			// Cleaned here, the page took a store without a fault, and that publication then
+			// wrote the GPU's old bytes over it.
+			size_t at = next;
+			for (auto page = chunk; page < chunk_end;) {
+				while (at < intervals.size() && intervals[at].address + intervals[at].size <= page) {
+					++at;
+				}
+				if (at == intervals.size() || intervals[at].address >= chunk_end) {
+					break;
+				}
+				const auto run_begin =
+				    std::max(page, Common::AlignDown(intervals[at].address, TRACKER_PAGE_SIZE));
+				auto   run_end = run_begin;
+				size_t scan    = at;
+				while (run_end < chunk_end) {
+					while (scan < intervals.size() &&
+					       intervals[scan].address + intervals[scan].size <= run_end) {
+						++scan;
+					}
+					if (scan == intervals.size() ||
+					    intervals[scan].address >= run_end + TRACKER_PAGE_SIZE) {
+						break;
+					}
+					run_end += TRACKER_PAGE_SIZE;
+				}
+				m_memory_tracker.PublishGpuModified(
+				    run_begin, run_end - run_begin,
+				    [&] { return copy.current.load(std::memory_order_acquire); },
+				    [&](uint64_t address, uint64_t bytes) noexcept {
+					    for (size_t i = at;
+					         i < intervals.size() && intervals[i].address < address + bytes; ++i) {
+						    const auto from = std::max(address, intervals[i].address);
+						    const auto to   = std::min(address + bytes,
+						                               intervals[i].address + intervals[i].size);
+						    if (from < to) {
+							    copy.buffer->ReadMapped(from - copy.buffer_address, to - from,
+							                            scratch.data());
+							    Libs::LibKernel::Memory::WriteBacking(from, scratch.data(),
+							                                          to - from);
+						    }
 					    }
-				    }
-				    published.push_back({address, bytes});
-			    });
+					    published.push_back({address, bytes});
+				    });
+				page = run_end;
+			}
 		}
 		if (!published.empty()) {
 			std::lock_guard lock(m_published_mutex);
@@ -1400,7 +1526,10 @@ void BufferCache::RecordAsyncDownloads() {
 		size_t                                 first_interval;
 		size_t                                 interval_count;
 		uint64_t                               bytes;
+		// The tracker pages of the caching page the download holds bytes for, a bit each.
+		uint32_t tracker_pages;
 	};
+	static_assert(CACHING_PAGESIZE / TRACKER_PAGE_SIZE <= 32);
 	std::vector<Interval>   page_intervals;
 	std::vector<PageRecord> pages;
 	uint64_t                total = 0;
@@ -1424,11 +1553,17 @@ void BufferCache::RecordAsyncDownloads() {
 			                   .faulted        = hot->second.faulted,
 			                   .first_interval = page_intervals.size(),
 			                   .interval_count = 0,
-			                   .bytes          = 0};
+			                   .bytes          = 0,
+			                   .tracker_pages  = 0};
 			m_gpu_modified_ranges.ForEachInRange(
 			    page, CACHING_PAGESIZE, [&](uint64_t begin, uint64_t last) {
 				    page_intervals.push_back({begin, last - begin, 0, *owner});
 				    record.bytes += Common::AlignUp(last - begin, 64);
+				    for (auto at = (std::max(begin, page) - page) / TRACKER_PAGE_SIZE;
+				         at < CACHING_PAGESIZE / TRACKER_PAGE_SIZE && page + at * TRACKER_PAGE_SIZE < last;
+				         ++at) {
+					    record.tracker_pages |= 1u << at;
+				    }
 			    });
 			record.interval_count = page_intervals.size() - record.first_interval;
 			if (record.interval_count != 0) {
@@ -1553,23 +1688,40 @@ void BufferCache::RecordAsyncDownloads() {
 	    [this, mapped, offset, total, intervals = std::move(intervals), pages = std::move(pages)] {
 		    m_download_buffer.Invalidate(offset, total);
 		    std::vector<Published> published;
+		    constexpr uint32_t     TrackerPages = CACHING_PAGESIZE / TRACKER_PAGE_SIZE;
 		    for (const auto& page: pages) {
-			    m_memory_tracker.PublishGpuModified(
-			        page.page, CACHING_PAGESIZE,
-			        [&] { return page.epoch_ptr->load(std::memory_order_acquire) == page.epoch; },
-			        [&](uint64_t address, uint64_t bytes) noexcept {
-				        for (const auto& interval: intervals) {
-					        const auto begin = std::max(address, interval.address);
-					        const auto end =
-					            std::min(address + bytes, interval.address + interval.size);
-					        if (begin < end) {
-						        LibKernel::Memory::WriteBacking(
-						            begin, mapped + interval.offset + (begin - interval.address),
-						            end - begin);
+			    // Of the caching page, the runs of tracker pages this download holds bytes for,
+			    // and no other. A tracker page that is GPU-dirty and has no bytes here was taken
+			    // by a readback the GPU thread recorded before this download (its byte ranges had
+			    // left the set) and still has to publish: cleaned here without its bytes, the page
+			    // could be read and stored into with the GPU's bytes still to come.
+			    for (uint32_t first = 0; first < TrackerPages;) {
+				    if ((page.tracker_pages & (1u << first)) == 0) {
+					    ++first;
+					    continue;
+				    }
+				    uint32_t last = first + 1;
+				    while (last < TrackerPages && (page.tracker_pages & (1u << last)) != 0) {
+					    ++last;
+				    }
+				    m_memory_tracker.PublishGpuModified(
+				        page.page + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE,
+				        [&] { return page.epoch_ptr->load(std::memory_order_acquire) == page.epoch; },
+				        [&](uint64_t address, uint64_t bytes) noexcept {
+					        for (const auto& interval: intervals) {
+						        const auto begin = std::max(address, interval.address);
+						        const auto end =
+						            std::min(address + bytes, interval.address + interval.size);
+						        if (begin < end) {
+							        LibKernel::Memory::WriteBacking(
+							            begin, mapped + interval.offset + (begin - interval.address),
+							            end - begin);
+						        }
 					        }
-				        }
-				        published.push_back({address, bytes});
-			        });
+					        published.push_back({address, bytes});
+				        });
+				    first = last;
+			    }
 		    }
 		    if (!published.empty()) {
 			    std::lock_guard lock(m_published_mutex);
