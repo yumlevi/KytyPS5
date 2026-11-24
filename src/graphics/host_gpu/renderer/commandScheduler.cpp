@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/liveControl.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/queueSubmitter.h"
@@ -16,6 +17,17 @@
 namespace Libs::Graphics {
 
 static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
+
+// 1: on the completion thread, what brings a submission's bytes into guest memory (the
+// downloads of its hot pages, BufferCache::RecordAsyncDownloads) runs before the other operations
+// of that submission's tick. 0: in the order queued, in which a label that rides with the commands
+// recorded after it (CommandProcessor::SubmitForLabel), a flip and a suspend point come before the
+// downloads of the submission they are delivered with: the guest was told the work was done and
+// read, from a page kept readable through the write (stale_readable), the bytes of before it.
+// In Saros a worker thread took an index from such a record and read through it (an access
+// violation at eboot.bin+0x45061f): with the hot set of 16,384 pages and whole fault windows
+// made hot, in 3 of 5 test runs of a level within 20 to 65 seconds.
+static Common::LiveControl::Switch g_publish_first("publish_first", 1);
 
 CommandScheduler::CommandPool::CommandPool(GraphicContext& graphics, MasterSemaphore& master)
     : m_graphics(graphics), m_master(master) {
@@ -223,8 +235,8 @@ void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) 
 }
 
 void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation,
-                                              GuestWrites                    writes) {
-	QueueOperation(std::move(operation), true, false, writes);
+                                              GuestWrites writes, bool first) {
+	QueueOperation(std::move(operation), true, false, writes, first);
 }
 
 uint64_t
@@ -239,7 +251,7 @@ uint64_t CommandScheduler::ActivePriorityTick() {
 }
 
 uint64_t CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, bool priority,
-                                          bool after_recorded, GuestWrites writes) {
+                                          bool after_recorded, GuestWrites writes, bool first) {
 	CheckActive();
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
@@ -252,7 +264,7 @@ uint64_t CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operati
 		}
 		if (priority) {
 			m_last_priority_tick = tick;
-			m_priority_operations.push_back({std::move(operation), tick, writes});
+			m_priority_operations.push_back({std::move(operation), tick, writes, first});
 		} else {
 			m_pending_operations.push({std::move(operation), tick});
 		}
@@ -274,7 +286,8 @@ uint64_t CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operati
 
 bool CommandScheduler::HasPendingPriorityWrites(uint64_t address, uint64_t size) {
 	std::lock_guard lock(m_operation_mutex);
-	if (m_priority_active_tick != 0 && m_priority_active_writes.Overlaps(address, size)) {
+	if (m_priority_active_tick != 0 && (m_priority_active_writes.Overlaps(address, size) ||
+	                                    m_priority_first_writes.Overlaps(address, size))) {
 		return true;
 	}
 	return std::ranges::any_of(m_priority_operations, [address, size](const auto& operation) {
@@ -285,7 +298,8 @@ bool CommandScheduler::HasPendingPriorityWrites(uint64_t address, uint64_t size)
 uint64_t CommandScheduler::PendingPriorityWriteTick(uint64_t address, uint64_t size) {
 	std::lock_guard lock(m_operation_mutex);
 	uint64_t        tick = 0;
-	if (m_priority_active_tick != 0 && m_priority_active_writes.Overlaps(address, size)) {
+	if (m_priority_active_tick != 0 && (m_priority_active_writes.Overlaps(address, size) ||
+	                                    m_priority_first_writes.Overlaps(address, size))) {
 		tick = m_priority_active_tick;
 	}
 	for (const auto& operation: m_priority_operations) {
@@ -314,6 +328,27 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 			m_priority_active_writes = operation.writes;
 		}
 		WaitTick(operation.tick);
+		// What goes first in this tick (PendingOperation::first): queued when the tick was
+		// submitted, so it is in the queue by now, behind this operation.
+		while (!stop.stop_requested() && g_publish_first.On()) {
+			PendingOperation first;
+			{
+				std::lock_guard lock(m_operation_mutex);
+				const auto      found =
+				    std::ranges::find_if(m_priority_operations, [&](const PendingOperation& queued) {
+					    return queued.first && queued.tick <= operation.tick;
+				    });
+				if (found == m_priority_operations.end()) {
+					break;
+				}
+				first = std::move(*found);
+				m_priority_operations.erase(found);
+				m_priority_first_writes = first.writes;
+			}
+			RunOperation(std::move(first.callback));
+			std::lock_guard lock(m_operation_mutex);
+			m_priority_first_writes = GuestWrites::None();
+		}
 		if (!stop.stop_requested()) {
 			RunOperation(std::move(operation.callback));
 		}

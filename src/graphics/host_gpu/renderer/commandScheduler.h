@@ -58,8 +58,15 @@ public:
 	void                      WaitPriorityOperations(uint64_t tick);
 	// Guest-memory completions use the priority queue; normal callbacks maintain GPU resources.
 	// `writes` is the guest memory a priority operation writes.
+	// `first`: the operation runs before the others of its tick, also those queued before it.
+	// It is for what brings a submission's bytes into guest memory: the downloads of a
+	// submission are queued when it is submitted, behind whatever announces its work to the
+	// guest and was queued while its commands were recorded (a label that rides with the
+	// commands after it, a flip, a suspend point). Announced first, the guest read bytes the
+	// submission had not brought yet.
 	void DeferOperation(Common::UniqueFunction<void>&& operation);
-	void DeferPriorityOperation(Common::UniqueFunction<void>&& operation, GuestWrites writes = {});
+	void DeferPriorityOperation(Common::UniqueFunction<void>&& operation, GuestWrites writes = {},
+	                            bool first = false);
 	// For an operation that depends only on GPU work recorded before this call, such as an
 	// end-of-pipe label: while the current command buffer holds no commands it completes with
 	// the previous submission, so it needs no submission of its own. Returns the tick the
@@ -113,12 +120,13 @@ private:
 		Common::UniqueFunction<void> callback;
 		uint64_t                     tick = 0;
 		GuestWrites                  writes;
+		bool                         first = false; // Before the other operations of its tick.
 	};
 
 	void BeginNext();
 	void PriorityOperationsThread(std::stop_token stop);
 	uint64_t QueueOperation(Common::UniqueFunction<void>&& operation, bool priority,
-	                        bool after_recorded = false, GuestWrites writes = {});
+	                        bool after_recorded = false, GuestWrites writes = {}, bool first = false);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
 	void WaitTick(uint64_t tick);
 
@@ -136,6 +144,8 @@ private:
 	std::jthread                 m_priority_thread;
 	uint64_t                     m_priority_active_tick = 0; // 0 while none runs
 	GuestWrites                  m_priority_active_writes = GuestWrites::None();
+	// Of the operation that runs ahead of the active one (PendingOperation::first).
+	GuestWrites                  m_priority_first_writes = GuestWrites::None();
 	uint64_t                     m_last_priority_tick   = 0; // Priority ticks never decrease.
 	uint64_t                     m_last_queued_tick     = 0; // Highest tick an operation waits for.
 	OperationState               m_operation_state      = OperationState::Open;

@@ -79,6 +79,11 @@ Common::LiveControl::Switch g_hot_window("hot_window", 1);
 // it only after a signal of that submission, which the completion thread delivers after the
 // publication). 0: the page faults from the write on, as a page outside the hot set does.
 Common::LiveControl::Switch  g_stale_readable("stale_readable", 1);
+// A test's handle on the time between what announces a submission and its hot pages' bytes: the
+// publication of a submission's hot-page downloads waits this many microseconds first. With the
+// operations run as queued (publish_first 0) that is time in which the guest, told the work is
+// done, reads the pages' old bytes; with the publication first it only delays the announcement.
+Common::LiveControl::Switch g_publish_delay_us("publish_delay_us", 0);
 // Guest read faults on bytes whose download was submitted and is not published yet: reads that
 // came before the publication (with stale_readable 1 those of a page kept readable do not
 // fault: they read the bytes of before the write).
@@ -561,6 +566,16 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	    });
 	if (copies.empty()) {
 		return false;
+	}
+	// The bytes of these pages come with this download now (their ranges left the set the hot
+	// pages' own download reads), and its publication runs where it was queued or, for the GPU
+	// thread's own, after that thread's wait: behind the labels of the submission. A page among
+	// them that was kept readable through a write (stale_readable) would show the guest, told the
+	// work is done, the bytes of before it. Until the publication, a read of it faults.
+	for (const auto& run: runs) {
+		if (m_memory_tracker.IsGpuModifiedReadable(run.address, run.bytes)) {
+			m_memory_tracker.SetGpuModifiedReadable(run.address, run.bytes, false);
+		}
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, total_size);
 
@@ -1276,17 +1291,24 @@ void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size) {
 		// A page served asynchronously never faults again, so the GPU writes keep it hot; it
 		// ages out once the GPU stops writing it.
 		it->second.touched = touch;
+		// A clean page keeps its (current) bytes readable while the recorded write is pending;
+		// a page still holding an unpublished write must fault into a readback instead.
+		// (stale_readable 0: every page faults until its download is published, and a read
+		// that comes before counts as an early read.)
+		const bool unreadable = !g_stale_readable.On() ||
+		                        m_memory_tracker.IsRegionGpuModified(it->first, CACHING_PAGESIZE);
+		// ... and stops being readable before its epoch moves: the epoch's move makes the
+		// completion thread leave out the bytes of the write before this one, and what announces
+		// that write follows at once. A page still readable then showed the bytes of before both.
+		if (unreadable && m_memory_tracker.IsGpuModifiedReadable(it->first, CACHING_PAGESIZE)) {
+			m_memory_tracker.SetGpuModifiedReadable(it->first, CACHING_PAGESIZE, false);
+		}
 		// The epoch advances before the write is marked GPU-dirty (SynchronizeBuffer): a publish
 		// that reads the old epoch under the region lock completes before the mark and a later
 		// one sees the new epoch and keeps the page dirty.
 		it->second.epoch->fetch_add(1, std::memory_order_acq_rel);
 		m_pending_async.Add(it->first, CACHING_PAGESIZE);
-		// A clean page keeps its (current) bytes readable while the recorded write is pending;
-		// a page still holding an unpublished write must fault into a readback instead.
-		// (stale_readable 0: every page faults until its download is published, and a read
-		// that comes before counts as an early read.)
-		if (!g_stale_readable.On() ||
-		    m_memory_tracker.IsRegionGpuModified(it->first, CACHING_PAGESIZE)) {
+		if (unreadable) {
 			m_make_unreadable.push_back(it->first);
 		} else {
 			m_keep_readable.push_back(it->first);
@@ -1686,6 +1708,9 @@ void BufferCache::RecordAsyncDownloads() {
 	}
 	m_scheduler.DeferPriorityOperation(
 	    [this, mapped, offset, total, intervals = std::move(intervals), pages = std::move(pages)] {
+		    if (const auto delay = g_publish_delay_us.Get(); delay != 0) {
+			    std::this_thread::sleep_for(std::chrono::microseconds(delay));
+		    }
 		    m_download_buffer.Invalidate(offset, total);
 		    std::vector<Published> published;
 		    constexpr uint32_t     TrackerPages = CACHING_PAGESIZE / TRACKER_PAGE_SIZE;
@@ -1729,7 +1754,9 @@ void BufferCache::RecordAsyncDownloads() {
 			    m_published_pending.store(true, std::memory_order_release);
 		    }
 	    },
-	    GuestWrites {written_begin, written_end - written_begin});
+	    // (First of its tick: before the labels, the flip and the suspend point that were queued
+	    // while the submission's commands were recorded.)
+	    GuestWrites {written_begin, written_end - written_begin}, true);
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size, bool by_address) {

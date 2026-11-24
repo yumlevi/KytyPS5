@@ -135,7 +135,11 @@ public:
 				return;
 			}
 			const StateChange change(*this);
-			m_stale_readable.SetRange(start, end);
+			// Only the GPU-dirty pages of the range: the bit is taken back with the dirty state
+			// (ChangeState, ForEachModifiedRange), so on a clean page it would stay, and a later
+			// GPU write of that page, with no download to bring its bytes, would leave it
+			// readable with the bytes of before for good.
+			m_stale_readable |= RegionBits(m_gpu_dirty, start, end);
 			UpdateProtection<false, true>();
 		} else {
 			const StateChange change(*this);
@@ -151,8 +155,9 @@ public:
 			const auto [start, end] = GetPageRange(page - m_cpu_addr, page_size);
 			if (!readable) {
 				m_stale_readable.UnsetRange(start, end);
-			} else if (m_gpu_dirty.FirstRangeFrom(start).first < end) {
-				m_stale_readable.SetRange(start, end);
+			} else {
+				// (Only the GPU-dirty pages, as above.)
+				m_stale_readable |= RegionBits(m_gpu_dirty, start, end);
 			}
 		}
 		if (readable) {
