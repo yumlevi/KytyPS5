@@ -197,6 +197,8 @@ struct VideoOutConfig {
 	uint64_t                            output_mode = VIDEO_OUT_OUTPUT_MODE_DEFAULT;
 	uint64_t                            pre_vblanks = 0;
 	uint64_t                            flip_vblank = 0; // vblank_status.count at the last flip.
+	// flip_when_done: the time the last flip kept to (the steady clock, ns).
+	int64_t                             flip_schedule_ns = 0;
 	VideoOutFlipStatus                  flip_status;
 	VideoOutVblankStatus                vblank_status;
 	std::array<VideoOutBuffer, VIDEO_OUT_BUFFER_NUM_MAX>                 buffers;
@@ -220,6 +222,9 @@ public:
 	void WaitForSubmitSlot(VideoOutConfig& cfg);
 	bool Flip();
 	void Wait(VideoOutConfig& cfg, int index);
+	// flip_when_done: when the group at the front, done, may flip (the steady clock, ns); 0
+	// while none is done.
+	[[nodiscard]] int64_t ReadyDueNs();
 
 private:
 	enum class RequestState { Reserved, Ready, Presenting };
@@ -279,6 +284,7 @@ public:
 
 	void VblankBegin();
 	void VblankEnd();
+	bool FlipBetweenVblanks(int64_t vblank_ns, const std::stop_token& token);
 	void PresentThread(std::stop_token token);
 
 	const uint32_t width; // The output size of every port.
@@ -486,9 +492,37 @@ static int DeleteVideoOutEvent(int handle, EventQueue::KernelEqueue eq, VideoOut
 	return result == LibKernel::KERNEL_ERROR_ENOENT ? OK : result;
 }
 
+// 1: a frame flips when it is done, as a PS5 does on a display with a variable refresh rate,
+// and not at the next tick of the 60 Hz vblank clock (after the Demon's Souls fork's VRR flips,
+// d4dd97365). On the ticks a game that renders 50 frames a second shows each for one vblank or
+// two by turns (16.7 or 33.3 ms: Saros at the heavy spot, p50 16.65 and p95 33.64 ms) while it
+// moves its world by its own frame times: uneven motion on any display, and uneven frames for
+// frame generation to pace. The present thread flips a done frame between the vblanks, at most
+// once a vblank period (the game's flip rate counts in periods too); the guest's vblanks keep
+// their own clock. 0: flips happen on the vblank ticks.
+static Common::LiveControl::Switch g_flip_when_done("flip_when_done", 1);
+
+static int64_t SteadyNs() {
+	return std::chrono::duration_cast<std::chrono::nanoseconds>(
+	           std::chrono::steady_clock::now().time_since_epoch())
+	    .count();
+}
+
+static int64_t VblankPeriodNs() {
+	return 1'000'000'000ll / std::max<int64_t>(Config::GetVblankFrequency(), 1);
+}
+
+// flip_when_done: the earliest time of the port's next flip.
+static int64_t FlipDueNsLocked(const VideoOutConfig& cfg) {
+	return cfg.flip_schedule_ns + (static_cast<int64_t>(cfg.flip_rate) + 1) * VblankPeriodNs();
+}
+
 // A flip is due once flip_rate + 1 vblanks have passed since the last flip, so a late frame flips
-// at the next vblank.
+// at the next vblank; with flip_when_done, once that many vblank periods of time have.
 static bool IsFlipDueLocked(const VideoOutConfig& cfg) {
+	if (g_flip_when_done.On()) {
+		return SteadyNs() >= FlipDueNsLocked(cfg);
+	}
 	const auto interval = static_cast<uint64_t>(cfg.flip_rate) + 1;
 
 	return interval <= 1 || cfg.vblank_status.count - cfg.flip_vblank >= interval;
@@ -668,6 +702,7 @@ int VideoOutDriver::Impl::Open(int bus_type, int index) {
 	config.flip_status.currentBuffer = -1;
 	config.pre_vblanks               = 0;
 	config.flip_vblank               = 0;
+	config.flip_schedule_ns          = 0;
 	config.vblank_status             = VideoOutVblankStatus();
 
 	return handle;
@@ -804,6 +839,28 @@ void VideoOutDriver::Impl::VblankEnd() {
 	}
 }
 
+// flip_when_done: sleeps until the vblank at `vblank_ns` (the steady clock) and flips, on the
+// way, each frame that is done once it is due. A frame done early sleeps until its time; while
+// none is done the thread looks for one every half millisecond (a high-resolution sleep: the
+// time-out of a condition variable follows the system timer, whose tick can be 15.6 ms). True
+// when a frame flipped.
+bool VideoOutDriver::Impl::FlipBetweenVblanks(int64_t vblank_ns, const std::stop_token& token) {
+	constexpr int64_t LOOK_NS = 500'000;
+
+	bool flipped = false;
+	for (int64_t now = SteadyNs(); now < vblank_ns && !token.stop_requested(); now = SteadyNs()) {
+		const int64_t due = m_flip_queue.ReadyDueNs();
+		if (due != 0 && now >= due && m_flip_queue.Flip()) {
+			flipped = true;
+			continue;
+		}
+		// (A frame that is due and did not flip, its port being closed: no spinning on it.)
+		const int64_t until = std::min(vblank_ns, due > now ? due : now + LOOK_NS);
+		Common::Thread::SleepNano(static_cast<uint64_t>(until - now));
+	}
+	return flipped;
+}
+
 void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 	using Clock       = std::chrono::steady_clock;
 	const auto period = Clock::duration(std::chrono::seconds(1)) / Config::GetVblankFrequency();
@@ -811,8 +868,18 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 	std::chrono::nanoseconds total_wait {};
 	while (!token.stop_requested()) {
 		const auto sleep_begin = Clock::now();
+		// flip_when_done: a frame flipped since the last vblank.
+		bool flipped_between = false;
 		if (total_wait.count() > 0) {
-			Common::Thread::SleepNano(static_cast<uint64_t>(total_wait.count()));
+			if (g_flip_when_done.On()) {
+				flipped_between = FlipBetweenVblanks(
+				    std::chrono::duration_cast<std::chrono::nanoseconds>(
+				        (sleep_begin + total_wait).time_since_epoch())
+				        .count(),
+				    token);
+			} else {
+				Common::Thread::SleepNano(static_cast<uint64_t>(total_wait.count()));
+			}
 		}
 		if (token.stop_requested()) {
 			break;
@@ -821,7 +888,8 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		total_wait -= frame_begin - sleep_begin;
 
 		VblankBegin();
-		bool presented = m_flip_queue.Flip();
+		// (A frame flipped since the last vblank is the newest one: no idle refresh of it.)
+		bool presented = m_flip_queue.Flip() || flipped_between;
 		if (!presented && m_presenter.NeedsSystemOverlayRefresh()) {
 			if (!m_presenter.PresentLastFrame()) {
 				m_presenter.Present(m_presenter.PrepareBlankFrame(width, height, true));
@@ -1086,6 +1154,31 @@ void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 	}
 }
 
+int64_t FlipQueue::ReadyDueNs() {
+	VideoOutConfig* cfg = nullptr;
+	{
+		Common::LockGuard lock(m_mutex);
+		const auto owner = std::find_if(m_requests.begin(), m_requests.end(),
+		                               [](const auto& r) { return r.group == r.id; });
+		if (owner == m_requests.end()) {
+			return 0;
+		}
+		const uint64_t group = owner->id;
+		if (std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(),
+		                [group](const auto& r) { return r.group == group; }) ||
+		    std::any_of(m_requests.begin(), m_requests.end(), [group](const auto& r) {
+			    return r.group == group && r.state != RequestState::Ready;
+		    })) {
+			return 0;
+		}
+		cfg = owner->cfg;
+	}
+	// (The port locks come before the queue's, as in Flip; a port is a slot of the driver and
+	// outlives its requests.)
+	Common::LockGuard lock(cfg->mutex);
+	return std::max<int64_t>(FlipDueNsLocked(*cfg), 1);
+}
+
 bool FlipQueue::Flip() {
 	KYTY_PROFILER_BLOCK("FlipQueue::Flip");
 
@@ -1141,6 +1234,8 @@ bool FlipQueue::Flip() {
 			                         r.premultiplied_alpha};
 		}
 	}
+	// (Before the present, whose own time is no lateness of the frame.)
+	const int64_t flip_ns = SteadyNs();
 	if (due) {
 		if (hidden != nullptr) {
 			m_presenter.Discard(*hidden);
@@ -1170,6 +1265,13 @@ bool FlipQueue::Flip() {
 		}
 		auto& r = *it;
 		r.cfg->flip_vblank = r.cfg->vblank_status.count;
+		// flip_when_done: a flip on time (within a quarter of a vblank period: the present
+		// thread's wake-up) keeps the next to the schedule, so that a game faster than the
+		// vblanks flips at their rate on average; a later one (the frame was done after it
+		// was due) starts the schedule again.
+		const int64_t flip_due  = FlipDueNsLocked(*r.cfg);
+		const bool    on_time   = flip_ns >= flip_due && flip_ns - flip_due < VblankPeriodNs() / 4;
+		r.cfg->flip_schedule_ns = on_time ? flip_due : flip_ns;
 		r.cfg->flip_status.count++;
 		r.cfg->flip_status.processTime              = LibKernel::KernelGetProcessTime();
 		r.cfg->flip_status.processTimeCounter       = LibKernel::KernelGetProcessTimeCounter();
