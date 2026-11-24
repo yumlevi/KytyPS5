@@ -821,6 +821,11 @@ struct GuestFaultMemoryStorage {
 };
 static GuestFaultMemoryStorage g_fault_memory;
 static std::atomic_flag        g_fault_memory_busy;
+// The report is in the log (a thread that faults meanwhile waits for it before it ends the
+// process), and the thread that writes it (a fault of its own inside the report waits for
+// nothing).
+static std::atomic<bool> g_fault_memory_done {false};
+static thread_local bool t_fault_memory_reporter = false;
 
 // Pointers found in the first GuestFaultPointerScan bytes of the register dumps (first qword of
 // each register, then the second, ...) and in the frame below rbp (nearest first), dumped once
@@ -966,8 +971,18 @@ static void ReportGuestFaultMemory(const Common::HostException::ExceptionInfo& i
 	if (g_fault_memory_busy.test_and_set(std::memory_order_acquire)) {
 		Log::WriteToConsoleAndLog("--- Guest memory at the registers: left out (another thread is "
 		                          "reporting a fault) ---\n");
+		// This thread's way out ends the process, and it is much shorter than the other
+		// thread's report (some 900 memory queries, a stop of every guest thread, one write
+		// of up to 190 KiB): two threads that fault on the same broken object would leave a
+		// log with this line and no report at all. Two seconds at most.
+		if (!t_fault_memory_reporter) {
+			for (int i = 0; i < 2000 && !g_fault_memory_done.load(std::memory_order_acquire); i++) {
+				Common::Thread::SleepNano(1'000'000);
+			}
+		}
 		return;
 	}
+	t_fault_memory_reporter                       = true;
 	const uint64_t                         now_ns = MonotonicNs();
 	auto*                                  s      = &g_fault_memory;
 	const std::pair<const char*, uint64_t> registers[GuestFaultMemoryStorage::Registers] = {
@@ -1016,6 +1031,7 @@ static void ReportGuestFaultMemory(const Common::HostException::ExceptionInfo& i
 	report.threads_total = threads_total;
 	FormatGuestFaultMemory(report, &s->text);
 	Log::WriteToConsoleAndLog(s->text.View());
+	g_fault_memory_done.store(true, std::memory_order_release);
 }
 
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
