@@ -127,6 +127,37 @@ with them; other places and machines will differ.
 
 ### Crashes and memory
 
+- **Eight fixes of the Saros fork's `saros-v0.1.8` to `saros-v0.1.12` are taken over** (its author
+  in turn took our lazy buffer synchronisation, the white flash fix and the readback work). Each
+  is its own commit with his text:
+  - *Lost graphics device*: a block-compressed texture could be given more mip levels than its
+    host image holds, and uploads of the extra ones wrote past the image's memory; and a draw
+    could keep an image that another binding of the same draw had just replaced. Both end in a
+    lost device once that memory is freed.
+  - *Wrong textures after a respawn* ("the rainbow outfit"): an image created again over memory
+    that had just been written back was uploaded from a stale buffer.
+  - *Objects missing with occlusion queries on*: a draw the emulator leaves out inside one of
+    the game's queries (its pipeline is still being built, its shader cannot run, it is
+    replaced by a copy) counted as hidden, so the game could cull what its draw shows. It now
+    counts as visible. Unlike the Saros fork, such a draw does not wait for its pipeline here:
+    it is left out as outside a query, so the frame does not stop for the build.
+  - *12 GB cards*: when the video memory budget fell during a load and came back seconds later,
+    the buffer collector stayed at the lower mark for the rest of the load and evicted buffers
+    shaders still read.
+  - *A crash*, `failed to read color metadata backing`, after the game unmapped the memory a
+    texture's metadata was in.
+  - *Reports*: a crash of the game now also lists the memory around its registers, the last
+    faults the emulator resolved on that thread and where every other game thread was; and a
+    scan reports up to 8,191 buffer accesses where it reported 1,023.
+  Not taken: what follows his move to a newer base of the main project (the pipeline record
+  formats 8 and 9), his launcher's settings, the background rebuild of a stale driver cache,
+  and the pieces this branch has in its own form (the device fault record, the commands of a
+  lost submission, the equal-address volume fix). Tried and set aside: his selection feedback,
+  which stops keeping images alive for textures a shader's table lists and never selects
+  (several GiB of video memory while walking in Shattered Rise, his number). It builds here,
+  but its GPU test fails on this branch's base (the test's shader samples the first texture
+  of its table whatever the key, also with his new code switched off), so it stays on the
+  side branch `wip/selection-feedback` until that is understood.
 - **The Saros fork's fixes up to `saros-v0.1.7` are merged**: the emulator follows the driver's
   current video memory budget and frees memory at once when it is over the limit, a lost
   graphics device on the lift ride into Shattered Rise and in similar spots is fixed (an older
