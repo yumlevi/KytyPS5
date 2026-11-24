@@ -70,6 +70,8 @@ public:
 	[[nodiscard]] uint64_t ActivePriorityTick();
 	// Whether a queued or running priority operation writes guest memory in the range.
 	[[nodiscard]] bool        HasPendingPriorityWrites(uint64_t address, uint64_t size);
+	// The latest tick such an operation waits for; 0 without one.
+	[[nodiscard]] uint64_t    PendingPriorityWriteTick(uint64_t address, uint64_t size);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }

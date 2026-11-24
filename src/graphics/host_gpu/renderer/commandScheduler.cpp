@@ -282,6 +282,20 @@ bool CommandScheduler::HasPendingPriorityWrites(uint64_t address, uint64_t size)
 	});
 }
 
+uint64_t CommandScheduler::PendingPriorityWriteTick(uint64_t address, uint64_t size) {
+	std::lock_guard lock(m_operation_mutex);
+	uint64_t        tick = 0;
+	if (m_priority_active_tick != 0 && m_priority_active_writes.Overlaps(address, size)) {
+		tick = m_priority_active_tick;
+	}
+	for (const auto& operation: m_priority_operations) {
+		if (operation.writes.Overlaps(address, size)) {
+			tick = std::max(tick, operation.tick);
+		}
+	}
+	return tick;
+}
+
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 	const Common::GpuTiming::SyncScope reason(Common::GpuTiming::SyncReason::Completion);
 	while (!stop.stop_requested()) {

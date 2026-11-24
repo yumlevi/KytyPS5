@@ -27,6 +27,10 @@ Common::LiveControl::Switch g_session_precompile("session_precompile", 2);
 // card of 16 GB is about 15 GiB).
 constexpr uint64_t SmallVideoMemory = 13ull << 30u;
 
+// 1: a guest unmap waits only for the completions that write its range (UnmapMemory); 0: for
+// everything the GPU still has to run, whenever a cache knows the memory.
+Common::LiveControl::Switch g_unmap_precise("unmap_precise", 1);
+
 } // namespace
 
 RenderContext::RenderContext(GraphicContext& graphics)
@@ -351,10 +355,28 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		// Check cache ownership on the GPU thread. Guest-memory callbacks can still
 		// write a range with no cached data, so the ones that write it must finish before it is
 		// unmapped.
-		if (m_command_scheduler.Active() &&
-		    (m_buffer_cache.IsRegionRegistered(vaddr, size) ||
-		     m_texture_cache.IsRegionRegistered(vaddr, size) ||
-		     m_command_scheduler.HasPendingPriorityWrites(vaddr, size))) {
+		if (!m_command_scheduler.Active()) {
+			// Nothing in flight.
+		} else if (g_unmap_precise.On()) {
+			// Only they have to: the publications of downloads, the labels and the query
+			// counters that land in the range (each names the memory it writes). Whatever else
+			// the GPU still runs needs no wait here: an image of the range is released when
+			// the commands that use it are done (DeleteImage), a cached buffer outlives the
+			// mapping, an entry of the image heap is reused once its tick ended (Retire), an
+			// upload still to be copied from these pages is copied below (CaptureRange), and
+			// GPU-written bytes of the range are read back by InvalidateMemory with waits of
+			// their own. Waiting for the GPU to finish everything (Finish) at every unmap of
+			// memory a cache knows stopped this thread for 4 to 7 ms on average, in half of
+			// the ten-second windows of a session played through the game; the Demon's Souls
+			// and the Ghost of Yotei forks came to wait for the same things only.
+			if (const auto tick = m_command_scheduler.PendingPriorityWriteTick(vaddr, size);
+			    tick != 0) {
+				m_command_scheduler.Wait(tick);
+				m_command_scheduler.WaitPriorityOperations(tick);
+			}
+		} else if (m_buffer_cache.IsRegionRegistered(vaddr, size) ||
+		           m_texture_cache.IsRegionRegistered(vaddr, size) ||
+		           m_command_scheduler.HasPendingPriorityWrites(vaddr, size)) {
 			const auto tick = m_command_scheduler.CurrentTick();
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);

@@ -62,8 +62,18 @@ void OcclusionQueries::PublishDumps(bool now) {
 		// The dumps depend only on draws recorded before this call, as a label does: the
 		// completion thread runs them, in the order of the queue, once the GPU has. A label
 		// queued after this one is written after these counters.
+		// The memory it writes (a dump is a block of counters, two words for each of the
+		// depth buffers, from its address on), for an unmap of other memory.
+		uint64_t first = UINT64_MAX;
+		uint64_t last  = 0;
+		for (const auto& dump: m_dumps) {
+			first = std::min(first, dump.address);
+			last  = std::max(last, dump.address);
+		}
+		const GuestWrites writes {first,
+		                          last - first + OCCLUSION_QUERY_DBS * 2u * sizeof(uint64_t)};
 		m_queued_tick = m_scheduler.DeferPriorityOperationAfterRecorded(
-		    [this, dumps = std::move(m_dumps)] { Complete(dumps); });
+		    [this, dumps = std::move(m_dumps)] { Complete(dumps); }, writes);
 		m_dumps.clear();
 	}
 	if ((now || !g_occlusion_defer.On()) && m_queued_tick != 0) {

@@ -5734,12 +5734,47 @@ public:
               cache.IsRegionRegistered(index_begin - 1, index_span + 2),
           "indexed lookup mishandled a half-open boundary, gap, or broad "
           "overlap");
+      // An unmap waits for what writes its range and for nothing else: the
+      // GPU's work in flight uses the cached buffer, which outlives the
+      // mapping.
       const auto clean_unmap_tick = scheduler.CurrentTick();
       resources.UnmapMemory(index_begin, index_page);
-      Require(name, "clean cached buffer unmap drain",
-              scheduler.CurrentTick() == clean_unmap_tick + 1 &&
+      Require(name, "clean cached buffer unmap",
+              scheduler.CurrentTick() == clean_unmap_tick &&
                   !resources.IsMapped(index_begin, index_page),
-              "unmapping a clean cached buffer did not drain native work");
+              "unmapping a clean cached buffer drained native work or left "
+              "the range mapped");
+      resources.MapMemory(index_begin, index_page);
+      // A completion that writes the range lands before the unmap returns.
+      std::atomic<bool> unmap_write_landed{false};
+      scheduler.DeferPriorityOperation(
+          [&unmap_write_landed] { unmap_write_landed.store(true); },
+          GuestWrites{index_begin + 0x40, sizeof(uint32_t)});
+      const auto written_unmap_tick = scheduler.CurrentTick();
+      resources.UnmapMemory(index_begin, index_page);
+      Require(name, "unmap behind a completion that writes the range",
+              unmap_write_landed.load() &&
+                  scheduler.CurrentTick() == written_unmap_tick + 1 &&
+                  !resources.IsMapped(index_begin, index_page),
+              "an unmap returned before a completion that writes its range "
+              "had run");
+      resources.MapMemory(index_begin, index_page);
+      // One that writes other memory is left to run later.
+      std::atomic<bool> other_write_landed{false};
+      scheduler.DeferPriorityOperation(
+          [&other_write_landed] { other_write_landed.store(true); },
+          GuestWrites{index_begin + 2 * index_page, sizeof(uint32_t)});
+      const auto other_unmap_tick = scheduler.CurrentTick();
+      resources.UnmapMemory(index_begin, index_page);
+      Require(name, "unmap beside a completion that writes other memory",
+              scheduler.CurrentTick() == other_unmap_tick &&
+                  !resources.IsMapped(index_begin, index_page),
+              "an unmap waited for a completion that writes other memory");
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      Require(name, "the other completion runs with its submission",
+              other_write_landed.load(),
+              "a completion left behind by an unmap never ran");
       resources.MapMemory(index_begin, index_page);
       const auto index_bridge =
           cache.FindBuffer(index_begin + index_page - 1, index_page + 2);
@@ -12007,12 +12042,13 @@ public:
       scheduler.DrainPriorityOperations();
       const auto image_unmap_tick = scheduler.CurrentTick();
       resources.UnmapMemory(image_address + 0x1000, 0x1000);
+      // (No drain: the image is released when the work that uses it is done.)
       Require(name, "partial image unmap tracking",
               partial_unmap_image_id &&
-                  scheduler.CurrentTick() == image_unmap_tick + 1 &&
+                  scheduler.CurrentTick() == image_unmap_tick &&
                   !texture_cache.IsRegionRegistered(image_address, 0x2000) &&
                   !texture_cache.FindImageFromRange(image_address, 0x2000, false),
-              "partial image unmap skipped its drain or retained the image");
+              "partial image unmap drained native work or retained the image");
 
       constexpr uint64_t unformatted_alias_offset = 0x2500000;
       auto unformatted_alias =
