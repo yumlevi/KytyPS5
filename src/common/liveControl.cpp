@@ -671,8 +671,6 @@ void HitchLog(double min_ms) {
 	uint64_t              seen = Detail::g_flips.load(std::memory_order_acquire);
 	for (;;) {
 		Thread::SleepNano(1'000'000);
-		// (The performance panel switches the counters off when it is closed.)
-		DebugCounters::SetEnabled(true);
 		const auto flips = Detail::g_flips.load(std::memory_order_acquire);
 		if (flips == seen) {
 			continue;
@@ -1272,6 +1270,9 @@ void Execute(uint64_t id, const std::string& line) {
 		              id, pending, at_start,
 		              std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
 		                  .count()));
+	} else if (command == "mark") {
+		Mark();
+		Answer(Format("LIVE mark id=%" PRIu64, id));
 	} else if (command == "threads") {
 		std::string list = Format("LIVE threads id=%" PRIu64, id);
 		for (const auto& thread: Threads()) {
@@ -1380,12 +1381,33 @@ void RegisterThread(const char* name) noexcept {
 	g_threads.push_back(std::move(thread));
 }
 
+void Mark() noexcept {
+	static std::atomic<uint32_t> marks {0};
+	const auto                   number = marks.fetch_add(1, std::memory_order_relaxed) + 1;
+	// (Flip times are kept from the first mark on, where no log had them kept already.)
+	Detail::g_active.store(true, std::memory_order_relaxed);
+	const auto clock = std::time(nullptr);
+	std::tm    local {};
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	localtime_s(&local, &clock);
+#else
+	localtime_r(&clock, &local);
+#endif
+	Log::WriteToConsoleAndLog(Format("Mark %02d:%02d:%02d #%u flip=%" PRIu64 "\n", local.tm_hour,
+	                                 local.tm_min, local.tm_sec, number,
+	                                 Detail::g_flips.load(std::memory_order_acquire)));
+	// What the two seconds after it were made of.
+	std::thread([number] {
+		Log::WriteToConsoleAndLog(MeasureLine(Format("MarkPerf #%u", number), 2.0) + "\n");
+	}).detach();
+}
+
 void Start() {
 	if (const char* text = std::getenv("KYTY_PERF_LOG"); text != nullptr) {
 		if (const double seconds = std::strtod(text, nullptr); seconds >= 1.0) {
 			Detail::g_active.store(true, std::memory_order_relaxed);
-			// (On for the whole session: a window's end leaves them as it found them.)
-			DebugCounters::SetEnabled(true);
+			// (On for the whole session, without the performance panel.)
+			DebugCounters::Hold();
 			std::thread(PerfLog, std::min(seconds, 600.0)).detach();
 		}
 	}
@@ -1393,7 +1415,7 @@ void Start() {
 		if (const double ms = std::strtod(text, nullptr); ms >= 1.0) {
 			Detail::g_active.store(true, std::memory_order_relaxed);
 			Detail::g_guest_waits.store(true, std::memory_order_relaxed);
-			DebugCounters::SetEnabled(true);
+			DebugCounters::Hold();
 			std::thread(HitchLog, ms).detach();
 		}
 	}

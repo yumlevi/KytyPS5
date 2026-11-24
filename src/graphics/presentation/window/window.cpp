@@ -504,6 +504,13 @@ void WindowContext::ProcessEvent(double time_s) {
 					Controller::CycleKeyboardPlayer();
 				}
 				return;
+			case SDLK_F9:
+				// A mark in the log: "I see it now". (The key is not taken from a key mapping
+				// that uses it: the event goes on.)
+				if (pressed) {
+					Common::LiveControl::Mark();
+				}
+				break;
 #if defined(__APPLE__)
 			case SDLK_P:
 				if ((event->key.mod & SDL_KMOD_GUI) == 0) {

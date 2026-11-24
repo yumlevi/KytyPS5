@@ -477,6 +477,13 @@ start. `present_crop` 1 to 9 shows a part of the picture pixel for pixel in the 
   causes above: frames in which the GPU thread sits idle because a game thread is held.
   `measure` also reports `step_ms`, how much a frame's time differs from the one before it,
   and the pages the hot set delivers a frame (`async_pages`).
+- **Both logs run without the performance panel.** The panel was the counters' own switch, so
+  either log put it on the screen for the whole session and F2 could not hide it. Now a log
+  holds the counters on by itself; F2 shows and hides the panel as before.
+- **A mark in the log** (the F9 key, or `mark` on the live channel): `Mark <time of day> #<n>`
+  and, two seconds later, `MarkPerf #<n>` with the numbers of `measure` for those two seconds.
+  For saying afterwards where in a long log something was seen on the screen (a wrong picture
+  has no line of its own). A key mapping that uses F9 keeps it.
 - `readback_log` (live switch, for a few seconds) writes a line for every readback a game
   thread's read asks for and for every store of the GPU thread into GPU-written pages;
   `stale_readable 0` with the counter `early_reads` counts reads that arrive before the

@@ -97,6 +97,11 @@ void SetHostHooks(const HostHooks& hooks) noexcept;
 // Starts the command thread when KYTY_LIVE_FILE names a command file.
 void Start();
 
+// The player marks a moment (the F9 key): a "Mark <time of day> #<n>" line goes to the log, and
+// a "MarkPerf #<n>" line with the numbers of `measure` for the two seconds after it. For telling
+// afterwards where in a long log something was seen on the screen.
+void Mark() noexcept;
+
 // Names the calling thread for `prof`, `threads` and the per-thread CPU time of `measure`
 // ("gpu" is the thread that translates guest commands).
 void RegisterThread(const char* name) noexcept;

@@ -60,6 +60,10 @@ enum class Peak { ShaderCompileNs, PipelineCreateNs, Count };
 
 namespace Detail {
 inline std::atomic<bool>     g_enabled {false};
+// The performance panel is on screen (it is what switches the counters on for a player).
+inline std::atomic<bool>     g_panel {false};
+// A log reads the counters for the whole session (Hold): they stay on without the panel.
+inline std::atomic<bool>     g_held {false};
 inline std::atomic<uint64_t> g_counters[static_cast<int>(Counter::Count)] {};
 inline std::atomic<uint64_t> g_peaks[static_cast<int>(Peak::Count)] {};
 } // namespace Detail
@@ -68,8 +72,28 @@ inline std::atomic<uint64_t> g_peaks[static_cast<int>(Peak::Count)] {};
 	return Detail::g_enabled.load(std::memory_order_relaxed);
 }
 
+// Off is refused while a log holds the counters on.
 inline void SetEnabled(bool enabled) noexcept {
-	Detail::g_enabled.store(enabled, std::memory_order_relaxed);
+	Detail::g_enabled.store(enabled || Detail::g_held.load(std::memory_order_relaxed),
+	                        std::memory_order_relaxed);
+}
+
+// The performance panel and the counters it shows. The panel was the counters' own switch: a
+// log that reads them (KYTY_PERF_LOG, KYTY_HITCH_LOG_MS) put the panel on the screen for the
+// whole session, over the game's own display, and the key that hides it could not.
+[[nodiscard]] inline bool PanelShown() noexcept {
+	return Detail::g_panel.load(std::memory_order_relaxed);
+}
+
+inline void SetPanelShown(bool shown) noexcept {
+	Detail::g_panel.store(shown, std::memory_order_relaxed);
+	SetEnabled(shown);
+}
+
+// The counters stay on from here on, whatever the panel does (false: as the panel has them).
+inline void Hold(bool held = true) noexcept {
+	Detail::g_held.store(held, std::memory_order_relaxed);
+	SetEnabled(held || PanelShown());
 }
 
 inline void Add(Counter counter, uint64_t value = 1) noexcept {

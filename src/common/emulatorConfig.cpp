@@ -17,7 +17,8 @@ void Initialize() {
 }
 
 void Shutdown() {
-	Common::DebugCounters::SetEnabled(false);
+	Common::DebugCounters::Hold(false);
+	Common::DebugCounters::SetPanelShown(false);
 	g_config.reset();
 }
 
@@ -29,7 +30,7 @@ void Load(const ConfigOptions& cfg) {
 	EXIT_IF(cfg.keyboard_player > static_cast<uint32_t>(MAX_PLAYERS));
 
 	*g_config = cfg;
-	Common::DebugCounters::SetEnabled(cfg.perf_overlay_enabled);
+	Common::DebugCounters::SetPanelShown(cfg.perf_overlay_enabled);
 }
 
 uint32_t GetScreenWidth() {
