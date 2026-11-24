@@ -57,6 +57,37 @@ Common::LiveControl::Switch g_async_upload("async_upload", 0);
 // resource walk take the tracking pages of the request only; 0: the download window around it,
 // as a guest read fault does.
 Common::LiveControl::Switch g_readback_narrow("readback_narrow", 1);
+// 1: a log line for every readback a guest read fault asks for (a census, for a few seconds).
+Common::LiveControl::Switch g_readback_log("readback_log", 0);
+// The most pages (of 16 KiB) the hot set holds: the pages a guest thread read back, whose next
+// GPU write is downloaded with its submission so that the next read finds the bytes in guest
+// memory (TouchHotPages). And 1: a guest read fault makes every page of the window it is served
+// hot, not the first 16 (256 KiB of 512). Every eighth frame Saros's render thread reads back,
+// from one of five buffers of 8 MiB in turn, 4 to 4.6 MiB the GPU wrote less than a frame
+// before: nine read faults, each a round trip to the GPU thread with a download of half a
+// megabyte, 10 to 15 ms in all, in which the GPU thread ran out of work: a frame of 30 to 38 ms
+// among frames of 19, about one and a half times a second while standing still. A set of 2,048
+// pages forgot those pages before their buffer came round again (some 260 readbacks a second
+// pass through it, the buffer returns after 1.3 s), and half of each window never entered it.
+// With 16,384 pages and whole windows (same boot, off and on twice): the slowest 1% of frames
+// 35.9 -> 22.0 and 23.2 ms, the longest 40 and 76 -> 24 and 26 ms, the 1% low 24-27 -> 42-44
+// fps, read-fault waits of the GPU thread 0.8 -> 0.0 a frame.
+Common::LiveControl::Switch g_hot_pages_max("hot_pages_max", 16384);
+Common::LiveControl::Switch g_hot_window("hot_window", 1);
+// 1: a hot page that is clean when the GPU writes it stays readable, with the bytes it had,
+// until the download that rode the write's submission is published (the game is taken to read
+// it only after a signal of that submission, which the completion thread delivers after the
+// publication). 0: the page faults from the write on, as a page outside the hot set does.
+Common::LiveControl::Switch  g_stale_readable("stale_readable", 1);
+// Guest read faults on bytes whose download was submitted and is not published yet: reads that
+// came before the publication (with stale_readable 1 those of a page kept readable do not
+// fault: they read the bytes of before the write).
+Common::LiveControl::Counter g_early_reads("early_reads");
+Common::LiveControl::Counter g_early_read_kb("early_read_kb");
+// 1: the window of a guest read fault doubles (to MaxReadAheadWindow) while the faults of a
+// read run on through a buffer.
+Common::LiveControl::Switch g_readback_ahead("readback_ahead", 1);
+constexpr uint64_t          MaxReadAheadWindow = 8 * DownloadWindowSize;
 
 // The most GPU-written bytes (in KiB) a readback copies out of a buffer's own mapping. The
 // mapping is device memory: a streaming load of it is a bus read per 64-byte line (RTX 4090:
@@ -137,6 +168,20 @@ Common::LiveControl::Counter g_bda_unread("bda_unread");
 Common::LiveControl::Switch  g_fault_ahead("fault_ahead", 0);
 Common::LiveControl::Counter g_fault_ahead_pages("fault_ahead_pages");
 Common::LiveControl::Counter g_fault_ahead_windows("fault_ahead_windows");
+
+// The most pages (of 4 KiB) a guest write fault on GPU-written bytes has read back after its
+// own (BufferCache::StoreAhead); 0: none, every page of such a run asks for its own readback.
+// While a level streams in, Saros's loading and worker threads overwrite memory the GPU wrote
+// before (blocks of its pools given to new data): thousands of pages in a row, each a write
+// fault, a request to the GPU thread and a copy of 4 KiB out of video memory: 50 to 260 us a
+// page, 50 to 250 ms for a burst, in which the GPU thread runs out of work (the frames of 60
+// to 260 ms of a walk through the game). With a window that doubles along a run the same bytes
+// take a few requests, and past a quarter megabyte the GPU copies them out. A cycle restarted
+// from the pause menu and the walk after it, one run each way: 52 -> 40 slow frames, 3.3 -> 2.7 s
+// over the usual frame time, the game's threads held 3.4 -> 1.8 s by such readbacks.
+Common::LiveControl::Switch  g_store_ahead("store_ahead", 256);
+Common::LiveControl::Counter g_store_ahead_pages("store_ahead_pages");
+Common::LiveControl::Counter g_store_ahead_windows("store_ahead_windows");
 
 std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
                                         StreamBuffer& staging, uint64_t size, uint64_t alignment,
@@ -740,15 +785,39 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size, bool guest_sto
 		g_invalidations_gpu.Add();
 	}
 	const Common::GpuTiming::SyncScope sync_reason(Common::GpuTiming::SyncReason::CpuWrite);
-	m_memory_tracker.InvalidateRegion(vaddr, size,
-	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
+	m_memory_tracker.InvalidateRegion(vaddr, size, [this, vaddr, size, guest_store, write_fault] {
+		ReadMemory(vaddr, size, true, write_fault && guest_store ? StoreAhead(vaddr) : 0);
+	});
 	QueueBdaSync(vaddr, size, guest_store);
 	if (write_fault && guest_store) {
 		FaultAhead(vaddr);
 	}
 }
 
-void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
+uint64_t BufferCache::StoreAhead(uint64_t vaddr) {
+	const auto limit = g_store_ahead.Get();
+	if (limit == 0) {
+		return 0;
+	}
+	// The run of one thread, as in FaultAhead: a fault on the page after the last one, or after
+	// the window the last one was given, doubles the window. A single store asks for its own
+	// page only, as before.
+	thread_local uint64_t next_page = 0;
+	thread_local uint32_t window    = 0;
+	const auto            page      = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	if (page != next_page) {
+		next_page = page + TRACKER_PAGE_SIZE;
+		window    = 0;
+		return 0;
+	}
+	window    = std::min<uint32_t>(window == 0 ? 2u : window * 2u, limit);
+	next_page = page + (uint64_t {window} + 1u) * TRACKER_PAGE_SIZE;
+	g_store_ahead_windows.Add();
+	g_store_ahead_pages.Add(window);
+	return uint64_t {window} * TRACKER_PAGE_SIZE;
+}
+
+void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, uint64_t ahead) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
@@ -761,7 +830,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		                  : Common::GpuTiming::SyncReason::BufferRead;
 	}
 	RequestGuestReadback({is_write ? GuestReadback::Kind::Write : GuestReadback::Kind::Read, vaddr,
-	                      size, reason, nullptr});
+	                      size, reason, nullptr, nullptr, ahead});
 }
 
 void BufferCache::ReadMemoryAround(uint64_t vaddr, uint64_t window) {
@@ -794,9 +863,17 @@ void BufferCache::RequestGuestReadback(const GuestReadback& request) {
 	// bytes are GPU-dirty still): then the request is asked again, to be served whole.
 	bool again = false;
 	if (request.kind == GuestReadback::Kind::Write) {
-		m_memory_tracker.InvalidateRegion(request.vaddr, request.size, [&] { again = true; });
+		// (A store with pages ahead: the whole window the copy took belongs to the CPU now, as
+		// after a fault on each of its pages.)
+		const bool wide = request.ahead != 0;
+		const auto base = wide ? copy->base : request.vaddr;
+		const auto size = wide ? copy->size : request.size;
+		m_memory_tracker.InvalidateRegion(base, size, [&] { again = true; });
 		if (!again) {
-			QueueBdaSync(request.vaddr, request.size);
+			if (wide) {
+				NoteStreamCopyStore(base, size);
+			}
+			QueueBdaSync(base, size);
 		}
 	} else {
 		again = m_memory_tracker.IsRegionGpuModified(
@@ -804,7 +881,9 @@ void BufferCache::RequestGuestReadback(const GuestReadback& request) {
 	}
 	if (again) {
 		g_guest_copy_again.Add();
-		QueueGuestReadback(request, nullptr);
+		auto whole  = request;
+		whole.ahead = 0;
+		QueueGuestReadback(whole, nullptr);
 	}
 }
 
@@ -897,8 +976,86 @@ void BufferCache::ServeGuestReadbacks(std::span<const GuestReadback> requests) {
 				start = std::max(Common::AlignDown(request.vaddr, TRACKER_PAGE_SIZE), start);
 				end   = std::min(Common::AlignUp(wanted_end, TRACKER_PAGE_SIZE), end);
 			}
+			if (request.kind == GuestReadback::Kind::Write && request.ahead != 0) {
+				// A store that runs on through GPU-written pages: those after its own, as far
+				// as the buffer goes (StoreAhead).
+				end = std::max(end, std::min(Common::AlignUp(wanted_end, TRACKER_PAGE_SIZE) +
+				                                 request.ahead,
+				                             buffer.CpuAddress() + buffer.Size()));
+			}
+			if (request.kind == GuestReadback::Kind::Around) {
+				// A guest thread that reads on through what the GPU wrote faults again where
+				// its window ends. While the faults follow one another the window doubles: the
+				// 4.5 MiB Saros's render thread reads of an 8 MiB buffer take four round trips to
+				// this thread, not nine (readback_ahead).
+				uint64_t window = DownloadWindowSize;
+				if (g_readback_ahead.On() && m_read_run_buffer == buffer_id &&
+				    request.vaddr >= m_read_run_end &&
+				    request.vaddr - m_read_run_end < DownloadWindowSize) {
+					window = std::min(m_read_run_window * 2, MaxReadAheadWindow);
+					end    = std::min(std::max(start + window, wanted_end),
+					                  buffer.CpuAddress() + buffer.Size());
+				}
+				m_read_run_buffer = buffer_id;
+				m_read_run_end    = end;
+				m_read_run_window = window;
+			}
 			result.base = start;
 			result.size = end - start;
+			if (request.kind == GuestReadback::Kind::Around && g_hot_window.On()) {
+				TouchHotPages(result.base, result.size, result.size / CACHING_PAGESIZE);
+			}
+		}
+		if (request.kind == GuestReadback::Kind::Around && request.handoff != nullptr &&
+		    Common::LiveControl::Active()) {
+			if (const auto tick = SubmittedDownloadTick(result.base, result.size); tick != 0) {
+				g_early_reads.Add();
+				g_early_read_kb.Add(result.size >> 10u);
+				if (g_readback_log.On()) {
+					LOGF("Readback log: early read at 0x%" PRIx64 " window 0x%" PRIx64 "+0x%" PRIx64
+					     ", its download is %" PRIu64 " ticks old and %s\n",
+					     request.vaddr, result.base, result.size, m_scheduler.CurrentTick() - tick,
+					     m_scheduler.IsFree(tick) ? "done on the GPU" : "still running");
+				}
+			}
+		}
+		if (g_readback_log.On() && request.kind == GuestReadback::Kind::Around) {
+			uint64_t dirty     = 0;
+			uint64_t intervals = 0;
+			uint64_t hot       = 0;
+			m_gpu_modified_ranges.ForEachInRange(result.base, result.size,
+			                                     [&](uint64_t begin, uint64_t end) {
+				                                     dirty += end - begin;
+				                                     intervals++;
+			                                     });
+			for (auto page = result.base & ~(CACHING_PAGESIZE - 1u); page < result.base + result.size;
+			     page += CACHING_PAGESIZE) {
+				hot += m_hot_pages.contains(page) ? 1 : 0;
+			}
+			LOGF("Readback log: read at 0x%" PRIx64 " buffer 0x%" PRIx64 "+0x%" PRIx64
+			     " window 0x%" PRIx64 "+0x%" PRIx64 " dirty %" PRIu64 " in %" PRIu64
+			     " pieces, hot pages %" PRIu64 ", write %" PRIu64 " ticks ago%s%s, submitted download %" PRIu64 "\n",
+			     request.vaddr, buffer.CpuAddress(), buffer.Size(), result.base, result.size, dirty,
+			     intervals, hot, m_scheduler.CurrentTick() - buffer.gpu_write_tick,
+			     buffer.gpu_write_open ? " (open)" : "", buffer.IsHostReadable() ? "" : " (not readable)",
+			     SubmittedDownloadTick(result.base, result.size));
+		}
+		if (g_readback_log.On() && request.kind == GuestReadback::Kind::Write &&
+		    request.handoff == nullptr) {
+			uint64_t dirty = 0;
+			m_gpu_modified_ranges.ForEachInRange(
+			    result.base, result.size, [&](uint64_t begin, uint64_t end) { dirty += end - begin; });
+			const auto submitted = SubmittedDownloadTick(result.base, result.size);
+			LOGF("Readback log: store at 0x%" PRIx64 "+%" PRIu64 " by the GPU thread (%s), window 0x%"
+			     PRIx64 "+0x%" PRIx64 " dirty %" PRIu64 ", the stored bytes are %s, write %" PRIu64
+			     " ticks ago%s, submitted download %s\n",
+			     request.vaddr, request.size, Common::GpuTiming::SyncReasonName(request.reason),
+			     result.base, result.size, dirty,
+			     m_gpu_modified_ranges.Intersects(request.vaddr, request.size) ? "GPU-written"
+			                                                                  : "not GPU-written",
+			     m_scheduler.CurrentTick() - buffer.gpu_write_tick,
+			     buffer.gpu_write_open ? " (open)" : "",
+			     submitted == 0 ? "none" : m_scheduler.IsFree(submitted) ? "done" : "running");
 		}
 		if (request.handoff != nullptr &&
 		    HandOffGuestCopy(request, buffer, buffer_id, result.base, result.size)) {
@@ -943,8 +1100,15 @@ void BufferCache::ServeGuestReadbacks(std::span<const GuestReadback> requests) {
 				m_memory_tracker.UnmarkRegionAsGpuModified(result.base, result.size);
 			}
 			if (requests[i].kind == GuestReadback::Kind::Write) {
-				m_memory_tracker.MarkRegionAsCpuModified(requests[i].vaddr, requests[i].size);
-				QueueBdaSync(requests[i].vaddr, requests[i].size);
+				// (With pages ahead: the window that was read back, see RequestGuestReadback.)
+				const bool wide = requests[i].ahead != 0 && result.copied;
+				const auto base = wide ? result.base : requests[i].vaddr;
+				const auto size = wide ? result.size : requests[i].size;
+				if (wide) {
+					NoteStreamCopyStore(base, size);
+				}
+				m_memory_tracker.MarkRegionAsCpuModified(base, size);
+				QueueBdaSync(base, size);
 			}
 		}
 		if (requests[i].done != nullptr && !result.handed) {
@@ -956,13 +1120,12 @@ void BufferCache::ServeGuestReadbacks(std::span<const GuestReadback> requests) {
 // The hot set: the pages the game reads back every frame (a town of Ghost of Yotei faults about
 // 500 distinct pages per frame). When full, the coldest eighth is evicted at once, so an insert
 // costs O(1) amortized instead of a scan of the whole set.
-static constexpr size_t   MaxHotPages      = 2048;
 static constexpr uint64_t MaxHotTouchPages = 16;
 
-void BufferCache::TouchHotPages(uint64_t vaddr, uint64_t size) {
+void BufferCache::TouchHotPages(uint64_t vaddr, uint64_t size, uint64_t most_pages) {
 	const auto first = vaddr & ~(CACHING_PAGESIZE - 1u);
 	const auto last  = std::min(Common::AlignUp(vaddr + size, CACHING_PAGESIZE),
-	                            first + MaxHotTouchPages * CACHING_PAGESIZE);
+	                            first + std::max(most_pages, MaxHotTouchPages) * CACHING_PAGESIZE);
 	const auto touch = ++m_hot_touch_sequence;
 	for (auto page = first; page < last; page += CACHING_PAGESIZE) {
 		if (auto it = m_hot_pages.find(page); it != m_hot_pages.end()) {
@@ -970,7 +1133,7 @@ void BufferCache::TouchHotPages(uint64_t vaddr, uint64_t size) {
 			it->second.faulted = touch;
 			continue;
 		}
-		if (m_hot_pages.size() >= MaxHotPages) {
+		if (m_hot_pages.size() >= std::max<size_t>(g_hot_pages_max.Get(), 64)) {
 			EvictColdHotPages(touch);
 		}
 		m_hot_pages.emplace(page, HotPage {.touched = touch,
@@ -1026,7 +1189,10 @@ void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size) {
 		m_pending_async.Add(it->first, CACHING_PAGESIZE);
 		// A clean page keeps its (current) bytes readable while the recorded write is pending;
 		// a page still holding an unpublished write must fault into a readback instead.
-		if (m_memory_tracker.IsRegionGpuModified(it->first, CACHING_PAGESIZE)) {
+		// (stale_readable 0: every page faults until its download is published, and a read
+		// that comes before counts as an early read.)
+		if (!g_stale_readable.On() ||
+		    m_memory_tracker.IsRegionGpuModified(it->first, CACHING_PAGESIZE)) {
 			m_make_unreadable.push_back(it->first);
 		} else {
 			m_keep_readable.push_back(it->first);

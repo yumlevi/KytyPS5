@@ -94,7 +94,8 @@ public:
 	// write_fault: the store is a guest write fault on the page of `vaddr` (see FaultAhead).
 	void InvalidateMemory(uint64_t vaddr, uint64_t size, bool guest_store = false,
 	                      bool write_fault = false);
-	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
+	// ahead: see GuestReadback.
+	void ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false, uint64_t ahead = 0);
 	// Reads back the GPU-modified range containing vaddr, from its page to at most window
 	// bytes past vaddr, or just the byte at vaddr when no GPU-modified range contains it.
 	void                                       ReadMemoryAround(uint64_t vaddr, uint64_t window);
@@ -191,6 +192,10 @@ public:
 	// After a guest thread's write fault on the page of `vaddr`: when the thread faulted on the
 	// page before it last (a store walking upwards), the pages after it are opened with it.
 	void FaultAhead(uint64_t vaddr);
+	// After a guest thread's write fault on a page of GPU-written bytes at `vaddr`: the bytes
+	// after the page to read back with it, when the thread's last such fault was on the page
+	// before (or before the window that fault was given).
+	[[nodiscard]] static uint64_t StoreAhead(uint64_t vaddr);
 	// A guest submission begins a store epoch (see BdaSyncQueue). Safe from any thread.
 	[[nodiscard]] uint64_t BeginBdaStoreEpoch();
 	// The upload worker's jobs so far, and a wait for those up to a sequence: a submission is
@@ -342,6 +347,9 @@ private:
 		// Where the GPU thread may leave the rest of the request to the requester; null: it
 		// serves all of it.
 		std::shared_ptr<GuestCopy>* handoff = nullptr;
+		// A store: the bytes after its pages that are read back with them while they lie in the
+		// same buffer (StoreAhead); the whole window then belongs to the CPU.
+		uint64_t ahead = 0;
 	};
 	void RequestGuestReadback(const GuestReadback& request);
 	// A guest thread: queues the request and returns once the GPU thread served it.
@@ -396,7 +404,13 @@ private:
 		uint64_t download_tick  = 0;
 		uint64_t download_epoch = 0;
 	};
-	void                        TouchHotPages(uint64_t vaddr, uint64_t size);
+	// The last window a guest read fault was served (ServeGuestReadbacks): its buffer, its end
+	// and its size.
+	BufferId m_read_run_buffer {};
+	uint64_t m_read_run_end    = 0;
+	uint64_t m_read_run_window = 0;
+	// `most_pages`: the most pages from `vaddr` on that become hot (16 at least).
+	void                        TouchHotPages(uint64_t vaddr, uint64_t size, uint64_t most_pages = 0);
 	// Drops the coldest eighth of the hot set; pages touched at `keep` stay.
 	void                        EvictColdHotPages(uint64_t keep);
 	std::vector<uint64_t>       m_hot_eviction_scratch;
