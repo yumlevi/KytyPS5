@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
+#include "common/memoryTrace.h"
+
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
@@ -84,6 +86,8 @@ Common::LiveControl::Switch  g_stale_readable("stale_readable", 1);
 // operations run as queued (publish_first 0) that is time in which the guest, told the work is
 // done, reads the pages' old bytes; with the publication first it only delays the announcement.
 Common::LiveControl::Switch g_publish_delay_us("publish_delay_us", 0);
+// 1: the memory trace is kept (common/memoryTrace.h), for a fatal report.
+Common::LiveControl::Switch g_mem_trace("mem_trace", 0);
 // Guest read faults on bytes whose download was submitted and is not published yet: reads that
 // came before the publication (with stale_readable 1 those of a page kept readable do not
 // fault: they read the bytes of before the write).
@@ -650,6 +654,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 					m_memory_tracker.PublishGpuModified(
 					    piece, piece_bytes, [] { return true; },
 					    [&](uint64_t address, uint64_t bytes) noexcept {
+						    Common::MemoryTrace::Note(Common::MemoryTrace::Kind::Publish, address, bytes);
 						    for (size_t i = first; i < copies.size() && begin_of(i) < address + bytes;
 						         ++i) {
 							    const auto from = std::max(address, begin_of(i));
@@ -850,6 +855,9 @@ void BufferCache::FaultAhead(uint64_t vaddr) {
 void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size, bool guest_store,
                                    bool write_fault) {
 	NoteStreamCopyStore(vaddr, size);
+	if (guest_store) {
+		Common::MemoryTrace::Note(Common::MemoryTrace::Kind::GuestStore, vaddr, size);
+	}
 	if (!guest_store) {
 		// A store of the emulated command processor, a write-back or an unmap: an upload the
 		// worker still has to copy from these pages belongs to earlier commands and must not
@@ -923,6 +931,7 @@ void BufferCache::ReadMemoryAround(uint64_t vaddr, uint64_t window) {
 }
 
 void BufferCache::RequestGuestReadback(const GuestReadback& request) {
+	Common::MemoryTrace::Note(Common::MemoryTrace::Kind::Readback, request.vaddr, request.size);
 	if (GuestGpu::IsGpuThread()) {
 		ServeGuestReadbacks({&request, 1});
 		return;
@@ -1281,6 +1290,7 @@ void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size) {
 			return false;
 		});
 	}
+	Common::MemoryTrace::Note(Common::MemoryTrace::Kind::GpuWrite, vaddr, size, m_scheduler.CurrentTick());
 	if (m_hot_pages.empty()) {
 		return;
 	}
@@ -1310,8 +1320,12 @@ void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size) {
 		m_pending_async.Add(it->first, CACHING_PAGESIZE);
 		if (unreadable) {
 			m_make_unreadable.push_back(it->first);
+			Common::MemoryTrace::Note(Common::MemoryTrace::Kind::MakeUnreadable, it->first, CACHING_PAGESIZE,
+			                          m_scheduler.CurrentTick());
 		} else {
 			m_keep_readable.push_back(it->first);
+			Common::MemoryTrace::Note(Common::MemoryTrace::Kind::KeepReadable, it->first, CACHING_PAGESIZE,
+			                          m_scheduler.CurrentTick());
 		}
 	}
 }
@@ -1454,6 +1468,7 @@ void BufferCache::RunGuestCopy(GuestCopy& copy) {
 				    run_begin, run_end - run_begin,
 				    [&] { return copy.current.load(std::memory_order_acquire); },
 				    [&](uint64_t address, uint64_t bytes) noexcept {
+					    Common::MemoryTrace::Note(Common::MemoryTrace::Kind::GuestCopy, address, bytes);
 					    for (size_t i = at;
 					         i < intervals.size() && intervals[i].address < address + bytes; ++i) {
 						    const auto from = std::max(address, intervals[i].address);
@@ -1528,6 +1543,7 @@ void BufferCache::RecordAsyncDownloads() {
 	if (!GuestGpu::IsGpuThread()) {
 		return;
 	}
+	Common::MemoryTrace::g_on.store(g_mem_trace.On(), std::memory_order_relaxed);
 	DrainPublished();
 	const CommandBuffer::ProfileGuard profile(m_scheduler.Current(),
 	                                          CommandBuffer::ProfileScope::Downloads);
@@ -1603,6 +1619,8 @@ void BufferCache::RecordAsyncDownloads() {
 	// pending would otherwise show stale bytes after the write ran.
 	const auto defer = [&](const PageRecord& record) {
 		m_pending_async.Add(record.page, CACHING_PAGESIZE);
+		Common::MemoryTrace::Note(Common::MemoryTrace::Kind::Deferred, record.page, CACHING_PAGESIZE,
+		                          m_scheduler.CurrentTick());
 		if (m_memory_tracker.IsGpuModifiedReadable(record.page, CACHING_PAGESIZE)) {
 			m_memory_tracker.SetGpuModifiedReadable(record.page, CACHING_PAGESIZE, false);
 		}
@@ -1707,7 +1725,7 @@ void BufferCache::RecordAsyncDownloads() {
 		written_end   = std::max(written_end, interval.address + interval.size);
 	}
 	m_scheduler.DeferPriorityOperation(
-	    [this, mapped, offset, total, intervals = std::move(intervals), pages = std::move(pages)] {
+	    [this, mapped, offset, total, download_tick, intervals = std::move(intervals), pages = std::move(pages)] {
 		    if (const auto delay = g_publish_delay_us.Get(); delay != 0) {
 			    std::this_thread::sleep_for(std::chrono::microseconds(delay));
 		    }
@@ -1731,8 +1749,18 @@ void BufferCache::RecordAsyncDownloads() {
 				    }
 				    m_memory_tracker.PublishGpuModified(
 				        page.page + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE,
-				        [&] { return page.epoch_ptr->load(std::memory_order_acquire) == page.epoch; },
+				        [&] {
+					        const bool current = page.epoch_ptr->load(std::memory_order_acquire) == page.epoch;
+					        if (!current) {
+						        Common::MemoryTrace::Note(Common::MemoryTrace::Kind::HotReject,
+						                                  page.page + first * TRACKER_PAGE_SIZE,
+						                                  (last - first) * TRACKER_PAGE_SIZE, download_tick);
+					        }
+					        return current;
+				        },
 				        [&](uint64_t address, uint64_t bytes) noexcept {
+					        Common::MemoryTrace::Note(Common::MemoryTrace::Kind::HotPublish, address, bytes,
+					                                  download_tick);
 					        for (const auto& interval: intervals) {
 						        const auto begin = std::max(address, interval.address);
 						        const auto end =
@@ -2089,6 +2117,9 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
                              bool src_gds) {
+	if (!dst_gds) {
+		Common::MemoryTrace::Note(Common::MemoryTrace::Kind::Copy, dst_vaddr, size, m_scheduler.CurrentTick());
+	}
 	const bool dst_memory = !dst_gds;
 	const bool src_memory = !src_gds;
 	if (dst_memory) {

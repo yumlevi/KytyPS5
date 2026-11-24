@@ -1,5 +1,6 @@
 #include "loader/runtimeLinker.h"
 
+#include "common/memoryTrace.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/debugCounters.h"
@@ -1031,6 +1032,33 @@ static void ReportGuestFaultMemory(const Common::HostException::ExceptionInfo& i
 	report.threads_total = threads_total;
 	FormatGuestFaultMemory(report, &s->text);
 	Log::WriteToConsoleAndLog(s->text.View());
+	// What the emulator did to the memory the registers point to (mem_trace 1), and what it
+	// announced to the guest, in the last half second.
+	if (Common::MemoryTrace::g_on.load(std::memory_order_relaxed)) {
+		static char   trace[24 * 1024];
+		const int64_t fault_ns = Common::MemoryTrace::NowNs();
+		const int64_t since_ns = fault_ns - 500'000'000;
+		for (size_t i = 0; i < GuestFaultMemoryStorage::Registers; i++) {
+			const uint64_t page = registers[i].second & ~uint64_t {0x3fff};
+			bool           seen = false;
+			for (size_t earlier = 0; earlier < i; earlier++) {
+				seen = seen || (registers[earlier].second & ~uint64_t {0x3fff}) == page;
+			}
+			if (seen || Common::MemoryTrace::Describe(trace, sizeof(trace), page, 0x4000, fault_ns, since_ns, false, 60) == 0) {
+				continue;
+			}
+			char head[160];
+			std::snprintf(head, sizeof(head),
+			              "--- What was done to the 16 KiB page of %s (0x%016" PRIx64 ") ---\n",
+			              registers[i].first, registers[i].second);
+			Log::WriteToConsoleAndLog(head);
+			Log::WriteToConsoleAndLog(trace);
+		}
+		if (Common::MemoryTrace::Describe(trace, sizeof(trace), 0, 0, fault_ns, fault_ns - 20'000'000, true, 60) != 0) {
+			Log::WriteToConsoleAndLog("--- What was announced to the guest (the 20 ms before this report) ---\n");
+			Log::WriteToConsoleAndLog(trace);
+		}
+	}
 	g_fault_memory_done.store(true, std::memory_order_release);
 }
 

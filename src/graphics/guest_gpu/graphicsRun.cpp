@@ -1,5 +1,6 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 
+#include "common/memoryTrace.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/gpuTiming.h"
@@ -652,7 +653,11 @@ bool GuestGpu::Process(Submission& submission) {
 			m_renderer.RunGarbageCollector();
 			cp.EmitGlobalBarrier();
 			m_renderer.GetCommandScheduler().DeferPriorityOperation(
-			    [ready = m_suspend_point_ready] { ready->release(); }, GuestWrites::None());
+			    [ready = m_suspend_point_ready] {
+				    Common::MemoryTrace::Note(Common::MemoryTrace::Kind::Suspend, 0, 0);
+				    ready->release();
+			    },
+			    GuestWrites::None());
 			const Common::GpuTiming::SyncScope sync_reason(
 			    Common::GpuTiming::SyncReason::FrameBoundary);
 			cp.BufferFlush();
@@ -2158,7 +2163,11 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 	auto& command = CurrentBuffer();
 	auto  request = Sync::PrepareVideoOutFlip(command, handle, index, flip_mode, flip_arg);
 	GetScheduler().DeferPriorityOperation(
-	    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); },
+	    [&renderer = m_renderer, request] {
+		    Common::MemoryTrace::Note(Common::MemoryTrace::Kind::Flip, 0, 0,
+		                              renderer.GetCommandScheduler().ActivePriorityTick());
+		    renderer.GetVideoOut().CompleteFlip(request);
+	    },
 	    GuestWrites::None());
 	const Common::GpuTiming::SyncScope sync_reason(Common::GpuTiming::SyncReason::Flip);
 	GetScheduler().Flush();

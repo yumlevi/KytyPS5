@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include "common/memoryTrace.h"
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/gpuTiming.h"
@@ -183,6 +184,8 @@ bool RenderContext::WaitWriteBacks(uint64_t vaddr, uint64_t size) {
 void RenderContext::DeliverLabel(void* dst, uint64_t value, uint32_t size,
                                  Common::UniqueFunction<void>&& notify, uint64_t label_id) {
 	EXIT_IF(dst == nullptr || (size != sizeof(uint32_t) && size != sizeof(uint64_t)));
+	Common::MemoryTrace::Note(Common::MemoryTrace::Kind::Label, reinterpret_cast<uint64_t>(dst), size,
+	                          m_command_scheduler.ActivePriorityTick());
 	// The completion thread runs the publications of a submission's downloads before its
 	// labels, so whatever the label announces is already in guest memory. The store epoch is read
 	// before the store: a wait of a submission of that epoch or earlier saw the store come later.
