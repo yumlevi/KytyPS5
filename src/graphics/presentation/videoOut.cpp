@@ -890,7 +890,18 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		VblankBegin();
 		// (A frame flipped since the last vblank is the newest one: no idle refresh of it.)
 		bool presented = m_flip_queue.Flip() || flipped_between;
-		if (!presented && m_presenter.NeedsSystemOverlayRefresh()) {
+		// flip_when_done: a finished frame that waits for its time within this vblank (it was
+		// microseconds short of it just now) brings the overlay with it. A refresh in front of
+		// it would show the old frame once more, with frame generation as a repeated one.
+		const auto frame_follows = [this] {
+			if (!g_flip_when_done.On()) {
+				return false;
+			}
+			const int64_t due = m_flip_queue.ReadyDueNs();
+			const int64_t now = SteadyNs();
+			return due > now && due - now < VblankPeriodNs();
+		};
+		if (!presented && m_presenter.NeedsSystemOverlayRefresh() && !frame_follows()) {
 			if (!m_presenter.PresentLastFrame()) {
 				m_presenter.Present(m_presenter.PrepareBlankFrame(width, height, true));
 			}
