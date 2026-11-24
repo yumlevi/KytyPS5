@@ -4,11 +4,13 @@
 #include "common/debugCounters.h"
 #include "common/gpuTiming.h"
 #include "common/logging/log.h"
+#include "common/threads.h"
 
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -30,6 +32,7 @@
 #include <windows.h> // IWYU pragma: keep
 // clang-format off
 #include <dbghelp.h>
+#include <intrin.h>
 #include <psapi.h>
 // clang-format on
 #endif
@@ -89,22 +92,56 @@ std::vector<NamedThread> Threads() {
 	return g_threads;
 }
 
-// CPU time a thread has used, in seconds; negative when unknown.
-double ThreadCpuSeconds(const NamedThread& thread) noexcept {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// The rate of the cycle counts Windows keeps per thread (the time stamp counter's), measured
+// once against the performance counter.
+double CyclesPerSecond() noexcept {
+	static const double rate = [] {
+		LARGE_INTEGER frequency {};
+		LARGE_INTEGER begin {};
+		LARGE_INTEGER end {};
+		QueryPerformanceFrequency(&frequency);
+		QueryPerformanceCounter(&begin);
+		const uint64_t first = __rdtsc();
+		Sleep(20);
+		QueryPerformanceCounter(&end);
+		const uint64_t last = __rdtsc();
+		if (end.QuadPart <= begin.QuadPart || last <= first) {
+			return 0.0;
+		}
+		return static_cast<double>(last - first) * static_cast<double>(frequency.QuadPart) /
+		       static_cast<double>(end.QuadPart - begin.QuadPart);
+	}();
+	return rate;
+}
+
+// CPU time the thread of a handle has used, in seconds; negative when unknown. From its cycle
+// count where that can be had: the times Windows keeps move by whole clock ticks (15.6 ms),
+// which says nothing about one frame.
+double HandleCpuSeconds(HANDLE handle) noexcept {
+	ULONG64 cycles = 0;
+	if (const double rate = CyclesPerSecond(); rate > 0.0 && QueryThreadCycleTime(handle, &cycles) != 0) {
+		return static_cast<double>(cycles) / rate;
+	}
 	FILETIME creation {};
 	FILETIME exit {};
 	FILETIME kernel {};
 	FILETIME user {};
-	// NOLINTNEXTLINE(performance-no-int-to-ptr)
-	if (GetThreadTimes(reinterpret_cast<HANDLE>(thread.handle), &creation, &exit, &kernel, &user) ==
-	    0) {
+	if (GetThreadTimes(handle, &creation, &exit, &kernel, &user) == 0) {
 		return -1.0;
 	}
 	const auto ticks = [](const FILETIME& time) {
 		return (static_cast<uint64_t>(time.dwHighDateTime) << 32u) | time.dwLowDateTime;
 	};
 	return static_cast<double>(ticks(kernel) + ticks(user)) / 1e7;
+}
+#endif
+
+// CPU time a thread has used, in seconds; negative when unknown.
+double ThreadCpuSeconds(const NamedThread& thread) noexcept {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// NOLINTNEXTLINE(performance-no-int-to-ptr)
+	return HandleCpuSeconds(reinterpret_cast<HANDLE>(thread.handle));
 #else
 	(void)thread;
 	return -1.0;
@@ -113,6 +150,11 @@ double ThreadCpuSeconds(const NamedThread& thread) noexcept {
 
 double ProcessCpuSeconds() noexcept {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	ULONG64 cycles = 0;
+	if (const double rate = CyclesPerSecond();
+	    rate > 0.0 && QueryProcessCycleTime(GetCurrentProcess(), &cycles) != 0) {
+		return static_cast<double>(cycles) / rate;
+	}
 	FILETIME creation {};
 	FILETIME exit {};
 	FILETIME kernel {};
@@ -145,10 +187,34 @@ constexpr std::array MEASURED_COUNTERS {
     std::pair {DebugCounter::PipelinesCreated, "pipelines"},
 };
 
+// More of them for the hitch lines alone (HitchLog): counts, and times in nanoseconds.
+constexpr std::array HITCH_COUNTERS {
+    std::pair {DebugCounter::DrawsSkippedPending, "draws_skipped"},
+    std::pair {DebugCounter::TextureEvictions, "texture_evictions"},
+    std::pair {DebugCounter::BufferEvictions, "buffer_evictions"},
+    std::pair {DebugCounter::ColorMetadataReadbacks, "metadata_readbacks"},
+    std::pair {DebugCounter::SwapchainRecreations, "swapchain_rebuilds"},
+    std::pair {DebugCounter::DroppedPresents, "dropped_presents"},
+    std::pair {DebugCounter::LateVblanks, "late_vblanks"},
+    std::pair {DebugCounter::AudioUnderruns, "audio_underruns"},
+    std::pair {DebugCounter::GuestFileReadBytes, "file_read_bytes"},
+    std::pair {DebugCounter::TextureDownloadBytes, "texture_download_bytes"},
+};
+constexpr std::array HITCH_TIMES {
+    std::pair {DebugCounter::ShaderCompileNs, "shader_compile"},
+    std::pair {DebugCounter::PipelineCreateNs, "pipeline_create"},
+    std::pair {DebugCounter::ColorMetadataReadbackNs, "metadata_readback"},
+    std::pair {DebugCounter::PresentNs, "present"},
+    std::pair {DebugCounter::PresentAcquireNs, "present_acquire"},
+    std::pair {DebugCounter::OverlayNs, "overlay"},
+};
+
 struct Snapshot {
 	int64_t                                          time_ns = 0;
 	uint64_t                                         flips   = 0;
 	std::array<uint64_t, MEASURED_COUNTERS.size()>   counters {};
+	std::array<uint64_t, HITCH_COUNTERS.size()>      hitch_counters {};
+	std::array<uint64_t, HITCH_TIMES.size()>         hitch_times_ns {};
 	uint64_t                                         gpu_thread_busy_ns = 0;
 	uint64_t                                         gpu_wait_ns        = 0;
 	uint64_t                                         buffer_upload      = 0;
@@ -167,6 +233,12 @@ Snapshot Take() {
 	snapshot.flips   = Detail::g_flips.load(std::memory_order_acquire);
 	for (size_t i = 0; i < MEASURED_COUNTERS.size(); i++) {
 		snapshot.counters[i] = DebugCounters::Get(MEASURED_COUNTERS[i].first);
+	}
+	for (size_t i = 0; i < HITCH_COUNTERS.size(); i++) {
+		snapshot.hitch_counters[i] = DebugCounters::Get(HITCH_COUNTERS[i].first);
+	}
+	for (size_t i = 0; i < HITCH_TIMES.size(); i++) {
+		snapshot.hitch_times_ns[i] = DebugCounters::Get(HITCH_TIMES[i].first);
 	}
 	snapshot.gpu_thread_busy_ns = DebugCounters::Get(DebugCounter::GpuThreadBusyNs);
 	snapshot.gpu_wait_ns        = DebugCounters::Get(DebugCounter::GpuWaitNs);
@@ -220,6 +292,22 @@ std::string MeasureLine(const std::string& head, double seconds) {
 			frame_ms.push_back(static_cast<double>(later - earlier) / 1e6);
 		}
 	}
+	// How evenly the frames came: by how much a frame time differs from the one before it (a
+	// frame on screen for 16.7 ms and the next for 33.3 differ by 16.7; a hitch moves only the
+	// high end).
+	std::vector<double> step_ms;
+	step_ms.reserve(frame_ms.size());
+	for (size_t i = 1; i < frame_ms.size(); i++) {
+		step_ms.push_back(std::abs(frame_ms[i] - frame_ms[i - 1]));
+	}
+	std::sort(step_ms.begin(), step_ms.end());
+	const auto step = [&](double q) {
+		if (step_ms.empty()) {
+			return 0.0;
+		}
+		return step_ms[std::min(step_ms.size() - 1,
+		                        static_cast<size_t>(q * static_cast<double>(step_ms.size())))];
+	};
 	std::sort(frame_ms.begin(), frame_ms.end());
 	const auto quantile = [&](double q) {
 		if (frame_ms.empty()) {
@@ -254,9 +342,10 @@ std::string MeasureLine(const std::string& head, double seconds) {
 
 	std::string line =
 	    head + Format(" seconds=%.2f flips=%" PRIu64
-	                  " fps=%.2f low1=%.2f frame_ms p50=%.2f p95=%.2f p99=%.2f max=%.2f",
+	                  " fps=%.2f low1=%.2f frame_ms p50=%.2f p95=%.2f p99=%.2f max=%.2f"
+	                  " step_ms mid=%.2f p90=%.2f",
 	                  elapsed, flips, fps, low, quantile(0.50), quantile(0.95), quantile(0.99),
-	                  frame_ms.empty() ? 0.0 : frame_ms.back());
+	                  frame_ms.empty() ? 0.0 : frame_ms.back(), step(0.50), step(0.90));
 	// The GPU thread per frame: wall time inside commands and submissions (waits included), its
 	// waits on the GPU, and its time without guest work (starved) or with every stream suspended.
 	line += Format(" | gpu_thread_ms busy=%.2f gpu_waits=%.2f starved=%.2f blocked=%.2f",
@@ -279,6 +368,11 @@ std::string MeasureLine(const std::string& head, double seconds) {
 	               per_frame(end.buffer_upload, begin.buffer_upload) / 1024.0,
 	               per_frame(end.texture_upload, begin.texture_upload) / 1024.0,
 	               per_frame(end.buffer_download, begin.buffer_download) / 1024.0);
+	// Pages (of 16 KiB) whose GPU writes were downloaded with their submission because a guest
+	// thread read them back before, and pages left for a later submission.
+	line += Format(" async_pages=%.1f async_deferred=%.1f",
+	               static_cast<double>(sync.async_pages) / frames,
+	               static_cast<double>(sync.async_deferred) / frames);
 	if (g_counters != nullptr) {
 		line += " | counters";
 		size_t index = 0;
@@ -349,6 +443,328 @@ void PerfLog(double seconds) {
 			continue;
 		}
 		Log::WriteToConsoleAndLog(line + "\n");
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// hitches
+
+// What a window cost: a time in milliseconds or a count, of the whole window.
+struct Cost {
+	std::string name;
+	double      value = 0.0;
+	bool        ms    = false;
+};
+
+std::vector<Cost> Costs(const Snapshot& begin, const Snapshot& end) {
+	std::vector<Cost> costs;
+	const auto time = [&](std::string name, uint64_t later, uint64_t earlier) {
+		costs.push_back({std::move(name), static_cast<double>(later - earlier) / 1e6, true});
+	};
+	const auto count = [&](std::string name, uint64_t later, uint64_t earlier, double unit = 1.0) {
+		costs.push_back({std::move(name), static_cast<double>(later - earlier) / unit, false});
+	};
+	const auto sync = end.sync.Since(begin.sync);
+	time("gpu_thread", end.gpu_thread_busy_ns, begin.gpu_thread_busy_ns);
+	time("gpu_wait", end.gpu_wait_ns, begin.gpu_wait_ns);
+	time("starved", sync.gpu_thread_starved_ns, 0);
+	time("blocked", sync.gpu_thread_blocked_ns, 0);
+	for (size_t reason = 0; reason < GpuTiming::SYNC_REASON_COUNT; reason++) {
+		const std::string name = GpuTiming::SyncReasonName(static_cast<GpuTiming::SyncReason>(reason));
+		time("wait:" + name, sync.wait_ns[reason], 0);
+		count("waits:" + name, sync.waits[reason], 0);
+	}
+	for (size_t i = 0; i < HITCH_TIMES.size(); i++) {
+		time(HITCH_TIMES[i].second, end.hitch_times_ns[i], begin.hitch_times_ns[i]);
+	}
+	for (size_t i = 0; i < MEASURED_COUNTERS.size(); i++) {
+		count(MEASURED_COUNTERS[i].second, end.counters[i], begin.counters[i]);
+	}
+	for (size_t i = 0; i < HITCH_COUNTERS.size(); i++) {
+		count(HITCH_COUNTERS[i].second, end.hitch_counters[i], begin.hitch_counters[i]);
+	}
+	count("buffer_upload_kb", end.buffer_upload, begin.buffer_upload, 1024.0);
+	count("texture_upload_kb", end.texture_upload, begin.texture_upload, 1024.0);
+	count("buffer_download_kb", end.buffer_download, begin.buffer_download, 1024.0);
+	size_t index = 0;
+	for (const auto* counter = g_counters; counter != nullptr; counter = counter->Next()) {
+		if (index < begin.named.size() && index < end.named.size()) {
+			count(counter->Name(), end.named[index], begin.named[index]);
+		}
+		index++;
+	}
+	if (begin.process_cpu >= 0.0 && end.process_cpu >= 0.0) {
+		costs.push_back({"cpu:process", 1000.0 * (end.process_cpu - begin.process_cpu), true});
+	}
+	for (const auto& [name, cpu]: end.thread_cpu) {
+		const auto earlier = std::find_if(begin.thread_cpu.begin(), begin.thread_cpu.end(),
+		                                  [&](const auto& entry) { return entry.first == name; });
+		const double base  = earlier != begin.thread_cpu.end() ? earlier->second : 0.0;
+		costs.push_back({"cpu:" + name, 1000.0 * (cpu - base), true});
+	}
+	return costs;
+}
+
+// The waits of guest threads (GuestWait), newest over oldest. A writer clears an entry's end
+// time, fills it and stores the end time last; the reader takes an entry whose end time is the
+// same before and after its copy.
+struct WaitEvent {
+	std::atomic<int64_t> end_ns {0};
+	int64_t              begin_ns = 0;
+	const char*          kind     = nullptr;
+	uint64_t             address  = 0;
+	uint64_t             bytes    = 0;
+	uint64_t             thread   = 0;
+};
+constexpr size_t                  WAIT_EVENTS = 16384;
+std::array<WaitEvent, WAIT_EVENTS> g_wait_events;
+std::atomic<uint64_t>             g_wait_next {0};
+
+uint64_t CurrentThreadNumber() noexcept {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	return GetCurrentThreadId();
+#else
+	return 0;
+#endif
+}
+
+// " | held <thread> <kind> x<count> <ms>ms (longest <ms> at <address>, <KiB> KiB) ..." for the
+// guest waits that ended in (from_ns, to_ns], the longest in total first; empty without any.
+std::string HeldText(int64_t from_ns, int64_t to_ns) {
+	struct Held {
+		uint64_t    thread  = 0;
+		const char* kind    = nullptr;
+		uint64_t    count   = 0;
+		int64_t     ns      = 0;
+		int64_t     longest = 0;
+		uint64_t    address = 0;
+		uint64_t    bytes   = 0;
+	};
+	std::vector<Held> held;
+	for (const auto& event: g_wait_events) {
+		const auto end = event.end_ns.load(std::memory_order_acquire);
+		if (end <= from_ns || end > to_ns) {
+			continue;
+		}
+		const auto  begin   = event.begin_ns;
+		const auto* kind    = event.kind;
+		const auto  address = event.address;
+		const auto  bytes   = event.bytes;
+		const auto  thread  = event.thread;
+		if (event.end_ns.load(std::memory_order_acquire) != end || kind == nullptr || begin > end) {
+			continue;
+		}
+		auto known = std::find_if(held.begin(), held.end(), [&](const Held& other) {
+			return other.thread == thread && other.kind == kind;
+		});
+		if (known == held.end()) {
+			held.push_back({thread, kind});
+			known = held.end() - 1;
+		}
+		known->count++;
+		known->ns += end - begin;
+		known->bytes += bytes;
+		if (end - begin >= known->longest) {
+			known->longest = end - begin;
+			known->address = address;
+		}
+	}
+	if (held.empty()) {
+		return {};
+	}
+	std::sort(held.begin(), held.end(), [](const Held& a, const Held& b) { return a.ns > b.ns; });
+	std::unordered_map<uint64_t, std::string> names;
+	if (g_hooks.guest_threads != nullptr) {
+		for (auto& [id, name]: g_hooks.guest_threads()) {
+			std::replace(name.begin(), name.end(), ' ', '_');
+			names[id] = std::move(name);
+		}
+	}
+	std::string text = " | held";
+	size_t      shown = 0;
+	for (const auto& item: held) {
+		if (shown++ == 8) {
+			break;
+		}
+		const auto name = names.find(item.thread);
+		text += Format(" %s %s x%" PRIu64 " %.1fms (longest %.1f at 0x%" PRIx64 ", %" PRIu64 " KiB);",
+		               name != names.end() && !name->second.empty()
+		                   ? name->second.c_str()
+		                   : Format("thread%" PRIu64, item.thread).c_str(),
+		               item.kind, item.count, static_cast<double>(item.ns) / 1e6,
+		               static_cast<double>(item.longest) / 1e6, item.address, item.bytes >> 10u);
+	}
+	return text;
+}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// The CPU times of the guest's own threads for a snapshot, as "guest:<name>" (threads of one
+// name together). A handle is kept per thread and closed when the thread is gone or renamed.
+class GuestThreadTimes {
+public:
+	void AddTo(Snapshot& snapshot) {
+		if (g_hooks.guest_threads == nullptr) {
+			return;
+		}
+		std::unordered_map<uint64_t, Kept> kept;
+		for (const auto& [id, name]: g_hooks.guest_threads()) {
+			HANDLE handle = nullptr;
+			if (const auto known = m_kept.find(id); known != m_kept.end() && known->second.name == name) {
+				handle = known->second.handle;
+				m_kept.erase(known);
+			} else {
+				handle = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(id));
+			}
+			if (handle == nullptr) {
+				continue;
+			}
+			kept.emplace(id, Kept {handle, name});
+			const double seconds = HandleCpuSeconds(handle);
+			if (seconds < 0.0) {
+				continue;
+			}
+			std::string label = "guest:" + (name.empty() ? std::to_string(id) : name);
+			std::replace(label.begin(), label.end(), ' ', '_');
+			const auto known = std::find_if(snapshot.thread_cpu.begin(), snapshot.thread_cpu.end(),
+			                                [&](const auto& entry) { return entry.first == label; });
+			if (known != snapshot.thread_cpu.end()) {
+				known->second += seconds;
+			} else {
+				snapshot.thread_cpu.emplace_back(std::move(label), seconds);
+			}
+		}
+		for (const auto& [id, gone]: m_kept) {
+			CloseHandle(gone.handle);
+		}
+		m_kept = std::move(kept);
+	}
+
+private:
+	struct Kept {
+		HANDLE      handle = nullptr;
+		std::string name;
+	};
+	std::unordered_map<uint64_t, Kept> m_kept;
+};
+#else
+class GuestThreadTimes {
+public:
+	void AddTo(Snapshot& /*snapshot*/) {}
+};
+#endif
+
+// KYTY_HITCH_LOG_MS=<milliseconds>: a line goes to the log for every frame that stayed on screen
+// at least that long and at least half as long again as the frames before it (their median),
+// with what it was made of beside the usual frame of the last second: the GPU thread's time, its
+// waits by reason, what was compiled, uploaded, read and evicted, and the CPU time of the named
+// threads. `measure` and KYTY_PERF_LOG average over seconds, in which one frame of 80 ms among
+// 500 does not show; a player feels that one. A side thread takes a snapshot of the counters at
+// every flip (it looks for one each millisecond), so the frame's own threads do no more for it
+// than count. A value reads "<this frame>(<usual frame>)"; apart from the first three, only those
+// far above the usual are listed, the times first.
+void HitchLog(double min_ms) {
+	constexpr size_t HISTORY     = 64;
+	constexpr size_t MOST_COUNTS = 14;
+
+	std::vector<Snapshot> history; // Oldest first; the last is of the newest flip seen.
+	GuestThreadTimes      guest_times;
+	uint64_t              seen = Detail::g_flips.load(std::memory_order_acquire);
+	for (;;) {
+		Thread::SleepNano(1'000'000);
+		// (The performance panel switches the counters off when it is closed.)
+		DebugCounters::SetEnabled(true);
+		const auto flips = Detail::g_flips.load(std::memory_order_acquire);
+		if (flips == seen) {
+			continue;
+		}
+		seen     = flips;
+		auto now = Take();
+		guest_times.AddTo(now);
+		const auto flip_ms = [](uint64_t flip) {
+			const auto earlier = Detail::g_flip_times_ns[(flip - 1) % Detail::FLIP_TIMES].load(
+			    std::memory_order_relaxed);
+			const auto later =
+			    Detail::g_flip_times_ns[flip % Detail::FLIP_TIMES].load(std::memory_order_relaxed);
+			return static_cast<double>(later - earlier) / 1e6;
+		};
+		if (history.size() >= 8 && now.flips > history.back().flips && history.front().flips >= 1) {
+			const auto& last  = history.back();
+			const auto& first = history.front();
+			// The longest frame since the last snapshot (one, unless this thread was late).
+			double frame = 0.0;
+			for (auto flip = last.flips; flip < now.flips; flip++) {
+				frame = std::max(frame, flip_ms(flip));
+			}
+			std::vector<double> before;
+			for (auto flip = first.flips; flip < last.flips; flip++) {
+				before.push_back(flip_ms(flip));
+			}
+			double usual = 0.0;
+			if (!before.empty()) {
+				const auto middle = before.begin() + static_cast<std::ptrdiff_t>(before.size() / 2);
+				std::nth_element(before.begin(), middle, before.end());
+				usual = *middle;
+			}
+			if (frame >= min_ms && usual > 0.0 && frame >= 1.5 * usual) {
+				const double usual_frames = static_cast<double>(last.flips - first.flips);
+				std::unordered_map<std::string, double> usual_costs;
+				for (const auto& cost: Costs(first, last)) {
+					usual_costs[cost.name] = cost.value / std::max(usual_frames, 1.0);
+				}
+				struct Listed {
+					std::string text;
+					double      weight = 0.0;
+				};
+				std::vector<Listed> times;
+				std::vector<Listed> counts;
+				std::string         head;
+				for (const auto& cost: Costs(last, now)) {
+					const double usually = usual_costs[cost.name];
+					const auto   text    = Format(cost.ms ? " %s=%.1f(%.1f)" : " %s=%.0f(%.1f)",
+					                              cost.name.c_str(), cost.value, usually);
+					if (cost.name == "gpu_thread" || cost.name == "gpu_wait" ||
+					    cost.name == "starved") {
+						head += text;
+					} else if (cost.ms && cost.value - usually >= 1.0) {
+						times.push_back({text, cost.value - usually});
+					} else if (!cost.ms && cost.value >= 1.5 * usually + 1.0) {
+						counts.push_back({text, (cost.value + 1.0) / (usually + 1.0)});
+					}
+				}
+				const auto heavier = [](const Listed& a, const Listed& b) {
+					return a.weight > b.weight;
+				};
+				std::sort(times.begin(), times.end(), heavier);
+				std::sort(counts.begin(), counts.end(), heavier);
+				if (counts.size() > MOST_COUNTS) {
+					counts.resize(MOST_COUNTS);
+				}
+				const auto clock = std::time(nullptr);
+				std::tm    local {};
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+				localtime_s(&local, &clock);
+#else
+				localtime_r(&clock, &local);
+#endif
+				auto line = Format("Hitch %02d:%02d:%02d frame_ms=%.1f usual=%.1f flip=%" PRIu64
+				                   " ms this(usual) |%s |",
+				                   local.tm_hour, local.tm_min, local.tm_sec, frame, usual,
+				                   now.flips, head.c_str());
+				for (const auto& item: times) {
+					line += item.text;
+				}
+				line += " | counts";
+				for (const auto& item: counts) {
+					line += item.text;
+				}
+				line += HeldText(last.time_ns, now.time_ns);
+				Log::WriteToConsoleAndLog(line + "\n");
+			}
+		}
+		history.push_back(std::move(now));
+		if (history.size() > HISTORY) {
+			history.erase(history.begin());
+		}
 	}
 }
 
@@ -927,6 +1343,22 @@ void SetHostHooks(const HostHooks& hooks) noexcept {
 	g_hooks = hooks;
 }
 
+void Detail::NoteGuestWait(const char* kind, uint64_t address, uint64_t bytes, int64_t begin_ns,
+                           int64_t least_ns) noexcept {
+	const auto end = SteadyNs();
+	if (end - begin_ns < least_ns) {
+		return;
+	}
+	auto& event = g_wait_events[g_wait_next.fetch_add(1, std::memory_order_relaxed) % WAIT_EVENTS];
+	event.end_ns.store(0, std::memory_order_release);
+	event.begin_ns = begin_ns;
+	event.kind     = kind;
+	event.address  = address;
+	event.bytes    = bytes;
+	event.thread   = CurrentThreadNumber();
+	event.end_ns.store(end, std::memory_order_release);
+}
+
 void RegisterThread(const char* name) noexcept {
 	NamedThread thread;
 	thread.name          = name;
@@ -955,6 +1387,14 @@ void Start() {
 			// (On for the whole session: a window's end leaves them as it found them.)
 			DebugCounters::SetEnabled(true);
 			std::thread(PerfLog, std::min(seconds, 600.0)).detach();
+		}
+	}
+	if (const char* text = std::getenv("KYTY_HITCH_LOG_MS"); text != nullptr) {
+		if (const double ms = std::strtod(text, nullptr); ms >= 1.0) {
+			Detail::g_active.store(true, std::memory_order_relaxed);
+			Detail::g_guest_waits.store(true, std::memory_order_relaxed);
+			DebugCounters::SetEnabled(true);
+			std::thread(HitchLog, ms).detach();
 		}
 	}
 	const char* path = std::getenv("KYTY_LIVE_FILE");

@@ -779,6 +779,11 @@ void BufferCache::RequestGuestReadback(const GuestReadback& request) {
 		ServeGuestReadbacks({&request, 1});
 		return;
 	}
+	const Common::LiveControl::GuestWait held(
+	    request.kind == GuestReadback::Kind::Write
+	        ? "readback-for-store"
+	        : request.kind == GuestReadback::Kind::Around ? "readback-for-read" : "readback",
+	    request.vaddr, request.size);
 	std::shared_ptr<GuestCopy> copy;
 	QueueGuestReadback(request, g_guest_copy.On() ? &copy : nullptr);
 	if (copy == nullptr) {

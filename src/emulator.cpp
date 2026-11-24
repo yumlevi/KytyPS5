@@ -28,6 +28,7 @@
 #include "libs/libs.h"
 #include "libs/network.h"
 #include "loader/additionalContent.h"
+#include "loader/guestFaultHistory.h"
 #include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
 
@@ -36,7 +37,10 @@
 #include <filesystem>
 #include <fmt/format.h>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <utility>
+#include <vector>
 
 namespace Emulator {
 
@@ -173,6 +177,14 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 	           uint64_t to, uint64_t* scanned) {
 		        return Libs::LibKernel::Memory::FindInBacking({pattern, size}, align, limit, from, to,
 		                                                      scanned);
+	        },
+	    .guest_threads =
+	        [] {
+		        std::vector<std::pair<uint64_t, std::string>> threads;
+		        Loader::GuestThreads().ForEach([&](uint64_t id, std::string_view name) {
+			        threads.emplace_back(id, std::string(name));
+		        });
+		        return threads;
 	        },
 	});
 	// --unreal-cvar: the title's own settings, once it runs.

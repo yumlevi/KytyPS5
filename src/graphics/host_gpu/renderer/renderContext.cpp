@@ -143,6 +143,8 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		return true;
 	}
 	if (access == PageFaultAccess::Write) {
+		// (Only the slow ones: a frame of Saros takes some 1,700 write faults.)
+		const Common::LiveControl::GuestWait held("write-fault", fault_vaddr, 0, 500);
 		// A store of the emulated command processor (on the GPU thread) is part of the current
 		// work; anything else stores for the guest CPU.
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size, !GuestGpu::IsGpuThread(), true);
@@ -163,6 +165,7 @@ bool RenderContext::WaitWriteBacks(uint64_t vaddr, uint64_t size) {
 	if (tick == 0) {
 		return false;
 	}
+	const Common::LiveControl::GuestWait held("image-write-back", vaddr, size);
 	// The GPU thread can fault inside a draw, so it submits without running deferred operations.
 	if (GuestGpu::IsGpuThread()) {
 		m_command_scheduler.Wait(tick);
@@ -369,6 +372,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		unmap();
 		return;
 	}
+	const Common::LiveControl::GuestWait held("unmap", vaddr, size);
 	m_gpu->SendCommandSync(unmap);
 }
 

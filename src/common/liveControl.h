@@ -5,6 +5,8 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <string>
+#include <utility>
 #include <vector>
 
 // A measurement channel for one boot and many same-process experiments. With KYTY_LIVE_FILE set
@@ -87,6 +89,8 @@ struct HostHooks {
 	std::vector<uint64_t> (*guest_find)(const uint8_t* pattern, size_t size, uint64_t align,
 	                                    size_t limit, uint64_t from, uint64_t to,
 	                                    uint64_t* scanned) = nullptr;
+	// The guest's own threads, as host thread ids and names (for the CPU times of a hitch line).
+	std::vector<std::pair<uint64_t, std::string>> (*guest_threads)() = nullptr;
 };
 void SetHostHooks(const HostHooks& hooks) noexcept;
 
@@ -100,6 +104,14 @@ void RegisterThread(const char* name) noexcept;
 namespace Detail {
 inline constexpr size_t      FLIP_TIMES = 8192;
 inline std::atomic<bool>     g_active {false};
+inline std::atomic<bool>     g_guest_waits {false};
+void NoteGuestWait(const char* kind, uint64_t address, uint64_t bytes, int64_t begin_ns,
+                   int64_t least_ns) noexcept;
+[[nodiscard]] inline int64_t SteadyNs() noexcept {
+	return std::chrono::duration_cast<std::chrono::nanoseconds>(
+	           std::chrono::steady_clock::now().time_since_epoch())
+	    .count();
+}
 inline std::atomic<uint64_t> g_flips {0};
 inline std::atomic<int64_t>  g_flip_times_ns[FLIP_TIMES] {};
 inline thread_local bool     t_gpu_thread = false;
@@ -119,6 +131,35 @@ inline void Counter::Add(uint64_t value) noexcept {
 		m_value.fetch_add(value, std::memory_order_relaxed);
 	}
 }
+
+// A wait the emulator puts a guest thread through (a readback of GPU-written memory, an unmap
+// that waits for the GPU, ...). With the hitch log on (KYTY_HITCH_LOG_MS) the line of a slow
+// frame names the waits that ended in it, by thread and kind: what the game's threads were held
+// up by while the GPU thread had nothing to do. `kind` is a literal; waits shorter than
+// `least_us` are left out. Without the hitch log a scope is one relaxed load.
+class GuestWait {
+public:
+	explicit GuestWait(const char* kind, uint64_t address = 0, uint64_t bytes = 0,
+	                   uint32_t least_us = 0) noexcept
+	    : m_kind(kind), m_address(address), m_bytes(bytes), m_least_us(least_us),
+	      m_begin_ns(Detail::g_guest_waits.load(std::memory_order_relaxed) ? Detail::SteadyNs()
+	                                                                         : 0) {}
+	~GuestWait() {
+		if (m_begin_ns != 0) {
+			Detail::NoteGuestWait(m_kind, m_address, m_bytes, m_begin_ns,
+			                      int64_t {m_least_us} * 1000);
+		}
+	}
+	GuestWait(const GuestWait&)            = delete;
+	GuestWait& operator=(const GuestWait&) = delete;
+
+private:
+	const char* m_kind;
+	uint64_t    m_address;
+	uint64_t    m_bytes;
+	uint32_t    m_least_us;
+	int64_t     m_begin_ns;
+};
 
 // A guest flip on the main bus (one caller thread).
 inline void NoteFlip() noexcept {
