@@ -1092,6 +1092,10 @@ void FindInputs(uint64_t shader_hash, const ShaderRecompiler::IR::ResourceSnapsh
 	if (!ReadView(resources, {static_cast<uint32_t>(motion.Width5()) + 1u, static_cast<uint32_t>(motion.Height5()) + 1u}, view)) {
 		return;
 	}
+	if (view.camera) {
+		// (The path a session took, for its log and for a replay of it.)
+		Common::LiveControl::NoteCamera(view.position.data(), view.forward.data());
+	}
 	// (The game's view of its velocity image, of its first layer as a 2D image.)
 	auto motion_view        = bindings.images[Motion].desc.view_info;
 	motion_view.type        = vk::ImageViewType::e2D;

@@ -20,6 +20,15 @@ void                     WindowRun();
 void                     WindowShutdown();
 // Asks the window loop to close, as the user closing the window does (any thread).
 void                     WindowRequestClose();
+// One gamepad event of a session's log ("Controller axis: ..." / "Controller button: ...", with
+// SDL's axis and button numbers and values) on the host-input pad: the translation the live
+// event took, whatever host_gamepads says (a test run ignores the PC's pads and still takes a
+// replay of a player's session). Any thread.
+void WindowReplayPadAxis(int sdl_axis, int sdl_value);
+void WindowReplayPadButton(int sdl_button, bool down);
+// The window's event clock now, in seconds: the time base of the log's input lines ("time = ").
+// Zero before the window loop runs. Any thread.
+[[nodiscard]] double WindowInputSeconds();
 // The renderer's background builds that have not finished (PipelineCache::
 // PendingBackgroundBuilds); zero without a renderer. Any thread, while the window lives.
 [[nodiscard]] uint64_t   WindowPendingBackgroundBuilds();

@@ -186,6 +186,11 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 		        });
 		        return threads;
 	        },
+	    .replay_axis   = [](int axis, int value) { Libs::Graphics::WindowReplayPadAxis(axis, value); },
+	    .replay_button = [](int button, bool down) {
+		    Libs::Graphics::WindowReplayPadButton(button, down);
+	    },
+	    .input_seconds = [] { return Libs::Graphics::WindowInputSeconds(); },
 	});
 	// --unreal-cvar: the title's own settings, once it runs.
 	Libs::LibKernel::UnrealCvars::Start(Config::UnrealCvars());

@@ -767,8 +767,15 @@ void WindowContext::ProcessEvent(double time_s) {
 	}
 }
 
+// When Run's timer started (steady clock, ns; 0: not yet), for WindowInputSeconds.
+static std::atomic<int64_t> g_event_clock_start_ns {0};
+
 void WindowContext::Run() {
 	Common::Timer timer;
+	g_event_clock_start_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count(),
+	                             std::memory_order_release);
 
 	loop.event     = {};
 	loop.need_exit = false;
@@ -906,6 +913,31 @@ void WindowRequestClose() {
 	SDL_Event event {};
 	event.type = SDL_EVENT_QUIT;
 	(void)SDL_PushEvent(&event);
+}
+
+void WindowReplayPadAxis(int sdl_axis, int sdl_value) {
+	const int id = Controller::HOST_INPUT_CONTROLLER_ID;
+	if (sdl_axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER || sdl_axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) {
+		HostInputPadTrigger(id, sdl_axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER,
+		                    ControllerAxisValueFromSdl(sdl_axis, sdl_value));
+	} else if (const auto axis = ControllerAxisFromSdl(sdl_axis); axis != Controller::Axis::AxisMax) {
+		Controller::SetAxis(id, axis, ControllerAxisValueFromSdl(sdl_axis, sdl_value));
+	}
+}
+
+void WindowReplayPadButton(int sdl_button, bool down) {
+	HostInputPadButton(Controller::HOST_INPUT_CONTROLLER_ID, sdl_button, down);
+}
+
+double WindowInputSeconds() {
+	const auto start = g_event_clock_start_ns.load(std::memory_order_acquire);
+	if (start == 0) {
+		return 0.0;
+	}
+	const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                     std::chrono::steady_clock::now().time_since_epoch())
+	                     .count();
+	return static_cast<double>(now - start) * 1e-9;
 }
 
 uint64_t WindowPendingBackgroundBuilds() {

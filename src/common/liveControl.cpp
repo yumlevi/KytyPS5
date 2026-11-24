@@ -1054,6 +1054,596 @@ void Pad(uint64_t id, const std::string& button, int ms) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// replay
+
+// 1: a "Camera:" line a frame (NoteCamera). 0: none; a replay steers by the camera all the same.
+Switch g_path_log("path_log", 1);
+// 1: a replay of a log that has the camera's path corrects the sticks towards it. 0: the events
+// alone, by the clock.
+Switch g_replay_track("replay_track", 1);
+
+// The camera as the renderer saw it last (NoteCamera).
+struct CameraNow {
+	double   time = 0.0; // The event clock.
+	double   position[3] {};
+	double   forward[3] {};
+	uint64_t frames = 0;
+	// The first frame since the camera came on (after 0.7 s or more without one: a loading
+	// screen, a film).
+	double run_start = 0.0;
+	double run_position[3] {};
+	double run_forward[3] {};
+};
+std::mutex g_camera_mutex;
+CameraNow  g_camera;
+
+// One gamepad event of a session's log.
+struct PadEvent {
+	double time;   // The event clock of that session, in seconds.
+	int    number; // SDL's axis or button
+	int    value;  // The axis value; 1 or 0 for a button down or up.
+	bool   axis;
+};
+
+// The camera in one frame of a session's log.
+struct PathPoint {
+	double time;
+	double position[3];
+	double yaw;   // Of its direction over the ground, radians.
+	double pitch; // Above the ground plane, radians.
+};
+
+struct Session {
+	std::vector<PadEvent>  events;
+	std::vector<PathPoint> path;
+};
+
+// What a full push of a stick does, fitted to the session itself (FitSticks): the camera's turn
+// for the right stick, the camera's speed along and across its direction for the left one. The
+// signs are the session's too (which way the game turns for a push to the right).
+struct StickGains {
+	double yaw     = 2.5;   // Radians a second at right stick x = +1.
+	double pitch   = -1.5;  // Radians a second at right stick y = +1 (down).
+	double forward = 600.0; // World units a second at left stick y = -1 (up).
+	double right   = 600.0; // World units a second at left stick x = +1.
+	int    yaw_samples = 0, pitch_samples = 0, forward_samples = 0, right_samples = 0;
+};
+
+// The replay that runs: a new one, or `replay stop`, ends the one before.
+std::atomic<uint32_t> g_replay_run {0};
+// Replay threads that have not let go of the pad yet: the next command waits for them, or their
+// release of the sticks and buttons would land on top of what it sets.
+std::atomic<uint32_t> g_replay_live {0};
+
+double WrapAngle(double angle) {
+	constexpr double Pi = 3.14159265358979323846;
+	while (angle > Pi) {
+		angle -= 2.0 * Pi;
+	}
+	while (angle < -Pi) {
+		angle += 2.0 * Pi;
+	}
+	return angle;
+}
+
+PathPoint MakePathPoint(double time, const double* position, const double* forward) {
+	PathPoint point {};
+	point.time = time;
+	for (int i = 0; i < 3; i++) {
+		point.position[i] = position[i];
+	}
+	point.yaw   = std::atan2(forward[1], forward[0]);
+	point.pitch = std::atan2(forward[2], std::hypot(forward[0], forward[1]));
+	return point;
+}
+
+// The gamepad events and the camera's path of a log from the event time `from` on, for `seconds`
+// (0: to the end). The lines are the window's ("Controller axis: <pad>, axis = <a>, value = <v>,
+// time = <t>", "Controller button: <pad>, down, pressed, button = <b>, time = <t>", of whatever
+// pad) and NoteCamera's ("Camera: x, y, z, fx, fy, fz, time = <t>").
+Session ReadSession(const std::string& path, double from, double seconds) {
+	Session       session;
+	std::ifstream file(path, std::ios::binary);
+	const auto    within = [&](double time) {
+        return time >= from && (seconds <= 0.0 || time <= from + seconds);
+	};
+	for (std::string line; std::getline(file, line);) {
+		if (line.starts_with("Camera: ")) {
+			double position[3] {};
+			double forward[3] {};
+			double time = 0.0;
+			if (std::sscanf(line.c_str(), "Camera: %lf, %lf, %lf, %lf, %lf, %lf, time = %lf",
+			                &position[0], &position[1], &position[2], &forward[0], &forward[1],
+			                &forward[2], &time) == 7 &&
+			    within(time)) {
+				session.path.push_back(MakePathPoint(time, position, forward));
+			}
+			continue;
+		}
+		if (!line.starts_with("Controller ")) {
+			continue;
+		}
+		PadEvent event {};
+		if (line.starts_with("Controller axis:")) {
+			int pad = 0;
+			if (std::sscanf(line.c_str(), "Controller axis: %d, axis = %d, value = %d, time = %lf",
+			                &pad, &event.number, &event.value, &event.time) != 4) {
+				continue;
+			}
+			event.axis = true;
+		} else if (line.starts_with("Controller button:")) {
+			const auto button = line.find("button = ");
+			const auto time   = line.find("time = ");
+			if (button == std::string::npos || time == std::string::npos) {
+				continue;
+			}
+			event.number = std::atoi(line.c_str() + button + 9);
+			event.value  = line.find(", down") != std::string::npos ? 1 : 0;
+			event.time   = std::strtod(line.c_str() + time + 7, nullptr);
+		} else {
+			continue;
+		}
+		if (within(event.time)) {
+			session.events.push_back(event);
+		}
+	}
+	return session;
+}
+
+double StickValue(int sdl_value) {
+	return std::clamp(static_cast<double>(sdl_value) / 32767.0, -1.0, 1.0);
+}
+
+// Fits what the sticks did in the session: for every two camera frames in a row, the turn and the
+// way made between them against the sticks' positions then (least squares through the origin,
+// over the frames with the stick pushed a third of the way or more).
+StickGains FitSticks(const Session& session) {
+	StickGains gains;
+	double     axes[4] {}; // left x, left y, right x, right y
+	size_t     next = 0;
+	double     yaw_xy = 0.0, yaw_xx = 0.0, pitch_xy = 0.0, pitch_xx = 0.0;
+	double     forward_xy = 0.0, forward_xx = 0.0, right_xy = 0.0, right_xx = 0.0;
+	for (size_t i = 1; i < session.path.size(); i++) {
+		const auto& a = session.path[i - 1];
+		const auto& b = session.path[i];
+		for (; next < session.events.size() && session.events[next].time <= a.time; next++) {
+			const auto& event = session.events[next];
+			if (event.axis && event.number >= 0 && event.number < 4) {
+				axes[event.number] = StickValue(event.value);
+			}
+		}
+		const double dt = b.time - a.time;
+		if (dt < 0.004 || dt > 0.12) {
+			continue;
+		}
+		const double yaw_rate   = WrapAngle(b.yaw - a.yaw) / dt;
+		const double pitch_rate = (b.pitch - a.pitch) / dt;
+		const double vx         = (b.position[0] - a.position[0]) / dt;
+		const double vy         = (b.position[1] - a.position[1]) / dt;
+		// (A cut or a teleport is no stick's doing.)
+		if (std::fabs(yaw_rate) > 12.0 || std::fabs(pitch_rate) > 12.0 || std::hypot(vx, vy) > 4000.0) {
+			continue;
+		}
+		if (std::fabs(axes[2]) >= 0.33) {
+			yaw_xy += axes[2] * yaw_rate;
+			yaw_xx += axes[2] * axes[2];
+			gains.yaw_samples++;
+		}
+		if (std::fabs(axes[3]) >= 0.33) {
+			pitch_xy += axes[3] * pitch_rate;
+			pitch_xx += axes[3] * axes[3];
+			gains.pitch_samples++;
+		}
+		const double along  = vx * std::cos(a.yaw) + vy * std::sin(a.yaw);
+		const double across = -vx * std::sin(a.yaw) + vy * std::cos(a.yaw);
+		if (std::fabs(axes[1]) >= 0.33) {
+			forward_xy += -axes[1] * along;
+			forward_xx += axes[1] * axes[1];
+			gains.forward_samples++;
+		}
+		if (std::fabs(axes[0]) >= 0.33) {
+			right_xy += axes[0] * across;
+			right_xx += axes[0] * axes[0];
+			gains.right_samples++;
+		}
+	}
+	// (A fit of a few frames, or of a stick that did nearly nothing, is no measure: the default
+	// stays, with the sign the fit has if it has one.)
+	const auto take = [](double xy, double xx, int samples, double least, double& gain) {
+		if (samples >= 30 && xx > 0.0 && std::fabs(xy / xx) >= least) {
+			gain = xy / xx;
+		}
+	};
+	take(yaw_xy, yaw_xx, gains.yaw_samples, 0.3, gains.yaw);
+	take(pitch_xy, pitch_xx, gains.pitch_samples, 0.2, gains.pitch);
+	take(forward_xy, forward_xx, gains.forward_samples, 100.0, gains.forward);
+	take(right_xy, right_xx, gains.right_samples, 100.0, gains.right);
+	return gains;
+}
+
+// The path's camera at `time`, between the two frames around it; false where the path has no
+// frame within a third of a second (the session showed a menu, a film or a loading screen then).
+bool PathAt(const std::vector<PathPoint>& path, double time, size_t& cursor, PathPoint& point) {
+	if (path.empty()) {
+		return false;
+	}
+	while (cursor + 1 < path.size() && path[cursor + 1].time <= time) {
+		cursor++;
+	}
+	const auto& a = path[cursor];
+	if (cursor + 1 >= path.size() || a.time > time) {
+		point = a;
+		return std::fabs(a.time - time) < 0.33;
+	}
+	const auto& b = path[cursor + 1];
+	if (b.time - a.time > 0.33) {
+		point = time - a.time < b.time - time ? a : b;
+		return std::fabs(point.time - time) < 0.33;
+	}
+	const double part = (time - a.time) / (b.time - a.time);
+	point.time        = time;
+	for (int i = 0; i < 3; i++) {
+		point.position[i] = a.position[i] + (b.position[i] - a.position[i]) * part;
+	}
+	point.yaw   = a.yaw + WrapAngle(b.yaw - a.yaw) * part;
+	point.pitch = a.pitch + (b.pitch - a.pitch) * part;
+	return true;
+}
+
+// A stick's position with a correction added. The game takes nothing from a stick near its
+// centre, so a correction of a resting stick starts where the game starts to listen.
+void AddCorrection(double base_x, double base_y, double add_x, double add_y, double dead,
+                   double& out_x, double& out_y) {
+	out_x            = base_x + add_x;
+	out_y            = base_y + add_y;
+	const double add = std::hypot(add_x, add_y);
+	// (Only a resting stick is lifted. A pushed one takes the plain sum: lifted as well, a
+	// correction against the push came out as a harder push, with it or against it.)
+	if (add > 1e-6 && std::hypot(base_x, base_y) < dead) {
+		out_x = add_x / add * (dead + add);
+		out_y = add_y / add * (dead + add);
+	}
+	out_x = std::clamp(out_x, -1.0, 1.0);
+	out_y = std::clamp(out_y, -1.0, 1.0);
+}
+
+void ReplayThread(uint32_t run, Session session, double from, bool on_camera) {
+	using Clock       = std::chrono::steady_clock;
+	const struct Live {
+		~Live() { g_replay_live.fetch_sub(1, std::memory_order_release); }
+	} live;
+	const auto& events = session.events;
+	const auto  gains  = FitSticks(session);
+	// How far into the session the replay starts (oncamera, when the level was up already).
+	double lead = 0.0;
+	if (on_camera && g_hooks.input_seconds != nullptr && !session.path.empty()) {
+		// The session's clock starts with the level's first frame: the camera comes on after a
+		// loading screen, which has none, where the session's came on (`from` is that frame's
+		// time in the session's log; the title screen has a camera too, somewhere else). A
+		// command that comes a moment late starts as far into the session as the level is old.
+		const auto& first         = session.path.front();
+		const auto  waiting_since = Clock::now();
+		for (;;) {
+			if (g_replay_run.load(std::memory_order_acquire) != run) {
+				return;
+			}
+			CameraNow camera;
+			{
+				const std::lock_guard lock(g_camera_mutex);
+				camera = g_camera;
+			}
+			const double now   = g_hooks.input_seconds();
+			const auto   began = MakePathPoint(camera.run_start, camera.run_position, camera.run_forward);
+			if (camera.frames != 0 && now - camera.time < 0.1 && now - camera.run_start < 4.0 &&
+			    std::hypot(began.position[0] - first.position[0], began.position[1] - first.position[1],
+			               began.position[2] - first.position[2]) < 100.0 &&
+			    std::fabs(WrapAngle(began.yaw - first.yaw)) < 0.1 && std::fabs(began.pitch - first.pitch) < 0.1) {
+				lead = std::max(now - camera.run_start, 0.0);
+				LOGF("Replay: the level's camera is on (waited %.1f s for it; it has been on for %.3f s)\n",
+				     std::chrono::duration<double>(Clock::now() - waiting_since).count(), lead);
+				break;
+			}
+			if (Clock::now() - waiting_since > std::chrono::seconds(120)) {
+				LOGF("Replay: the session's level did not come up within two minutes; starting now, "
+				     "NOT at the level's first frame\n");
+				break;
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+	} else if (on_camera) {
+		LOGF("Replay: the log has no camera path from %.3f on: starting with the command, by the clock\n", from);
+	}
+	// The path is compared whenever the log has one; replay_track 0 leaves the sticks alone.
+	const bool  track  = session.path.size() >= 2 && g_hooks.input_seconds != nullptr;
+	const bool  correct = track && g_replay_track.On();
+	LOGF("Replay: %zu events, %zu camera frames; %s. A full push turns %.0f deg/s (%d frames) and looks "
+	     "up or down %.0f deg/s (%d), walks %.0f units/s ahead (%d) and %.0f to the side (%d)\n",
+	     events.size(), session.path.size(),
+	     correct ? "the sticks are corrected towards the path" : "by the clock alone",
+	     gains.yaw * 57.2958, gains.yaw_samples, gains.pitch * 57.2958, gains.pitch_samples, gains.forward,
+	     gains.forward_samples, gains.right, gains.right_samples);
+
+	const auto start = Clock::now();
+	uint64_t   down  = 0;  // Buttons the replay holds, a bit each.
+	size_t     done  = 0;
+	double     base[6] {}; // The session's sticks and triggers now, as SDL values.
+	int        sent[6] {};
+	size_t     cursor = 0;
+	// How far off the path: sums over the frames compared, and the largest.
+	uint64_t compared = 0, far_frames = 0;
+	double   sum_distance = 0.0, max_distance = 0.0, sum_turn = 0.0, max_turn = 0.0;
+	double   next_report = 1.0;
+	uint64_t seen_frames = 0;
+	// The session's clock (`played`, from `from` on): this replay's, a little slower for a player
+	// who is behind on the way and faster for one ahead, and set back or forward where the player
+	// left the path and stands on another part of it (Seek).
+	double played = lead, last_near = 0.0;
+	double rate      = 1.0; // The session's clock against this replay's, for the next step.
+	double off_since = -1.0, next_seek = 0.0, last_seek_to = -1e9;
+	int    seeks = 0, same_seeks = 0;
+	auto   last_tick = start;
+	const double end_time = events.empty() ? (session.path.empty() ? from : session.path.back().time)
+	                                       : std::max(events.back().time,
+	                                                  session.path.empty() ? from : session.path.back().time);
+	// Sets the session's clock to the event time `to`: the events after it are due (again), and the
+	// sticks and buttons are what the session had them at then.
+	const auto seek = [&](double to) {
+		played = to - from;
+		done   = static_cast<size_t>(
+            std::partition_point(events.begin(), events.end(), [to](const PadEvent& event) { return event.time <= to; }) -
+            events.begin());
+		std::fill_n(base, 6, 0.0);
+		uint64_t then = 0;
+		for (size_t i = 0; i < done; i++) {
+			const auto& event = events[i];
+			if (event.axis) {
+				if (event.number >= 0 && event.number < 6) {
+					base[event.number] = event.value;
+				}
+			} else if (event.number >= 0 && event.number < 64) {
+				then = event.value != 0 ? then | (uint64_t {1} << event.number) : then & ~(uint64_t {1} << event.number);
+			}
+		}
+		for (int button = 0; button < 64; button++) {
+			const auto bit = uint64_t {1} << button;
+			if (((down ^ then) & bit) != 0) {
+				g_hooks.replay_button(button, (then & bit) != 0);
+			}
+		}
+		down   = then;
+		cursor = 0;
+	};
+	for (;;) {
+		if (g_replay_run.load(std::memory_order_acquire) != run) {
+			break;
+		}
+		const auto   tick    = Clock::now();
+		const double step    = std::chrono::duration<double>(tick - last_tick).count();
+		const double elapsed = std::chrono::duration<double>(tick - start).count();
+		last_tick            = tick;
+		played += step * rate;
+		rate              = 1.0;
+		const double time = from + played;
+		// The session's events that are due.
+		for (; done < events.size() && events[done].time <= time; done++) {
+			const auto& event = events[done];
+			if (event.axis) {
+				if (event.number >= 0 && event.number < 6) {
+					base[event.number] = event.value;
+				}
+				if (g_path_log.On() && g_hooks.input_seconds != nullptr) {
+					LOGF("Controller axis: -1, axis = %d, value = %d, time = %.4f\n", event.number,
+					     event.value, g_hooks.input_seconds());
+				}
+			} else {
+				g_hooks.replay_button(event.number, event.value != 0);
+				if (event.number >= 0 && event.number < 64) {
+					down = event.value != 0 ? down | (uint64_t {1} << event.number)
+					                        : down & ~(uint64_t {1} << event.number);
+				}
+				if (g_path_log.On() && g_hooks.input_seconds != nullptr) {
+					LOGF("Controller button: -1, %s, button = %d, time = %.4f\n",
+					     event.value != 0 ? "down, pressed" : "up, released", event.number,
+					     g_hooks.input_seconds());
+				}
+			}
+		}
+		if (time > end_time) {
+			break;
+		}
+		// The sticks: the session's, and what brings the camera back to the session's path.
+		double out[4] {StickValue(static_cast<int>(base[0])), StickValue(static_cast<int>(base[1])),
+		               StickValue(static_cast<int>(base[2])), StickValue(static_cast<int>(base[3]))};
+		if (track) {
+			CameraNow camera;
+			{
+				const std::lock_guard lock(g_camera_mutex);
+				camera = g_camera;
+			}
+			PathPoint  target {};
+			const bool fresh = camera.frames != 0 && g_hooks.input_seconds() - camera.time < 0.25;
+			if (fresh && PathAt(session.path, time, cursor, target)) {
+				const auto   now      = MakePathPoint(camera.time, camera.position, camera.forward);
+				const double turn     = WrapAngle(target.yaw - now.yaw);
+				const double tilt     = target.pitch - now.pitch;
+				const double dx       = target.position[0] - now.position[0];
+				const double dy       = target.position[1] - now.position[1];
+				const double ahead    = dx * std::cos(now.yaw) + dy * std::sin(now.yaw);
+				const double side     = -dx * std::sin(now.yaw) + dy * std::cos(now.yaw);
+				const double distance = std::hypot(dx, dy);
+				// Proportional, with a band in which nothing is corrected (the camera's own sway,
+				// and the frame or two by which what is seen here is old).
+				constexpr double TurnRate = 5.0, WalkRate = 3.0; // Per second.
+				constexpr double TurnBand = 0.012, WalkBand = 40.0;
+				// Where the session's player was moving on, the session's clock runs slower for
+				// a player who is behind on that way and faster for one who is ahead: running flat
+				// out, the sticks have nothing left to catch up with, and a button pressed by the
+				// clock (a jump, a dash) should come at the place it came at.
+				if (correct && cursor + 1 < session.path.size()) {
+					const auto&  a  = session.path[cursor];
+					const auto&  b  = session.path[cursor + 1];
+					const double dt = b.time - a.time;
+					const double vx = dt > 0.004 && dt < 0.12 ? (b.position[0] - a.position[0]) / dt : 0.0;
+					const double vy = dt > 0.004 && dt < 0.12 ? (b.position[1] - a.position[1]) / dt : 0.0;
+					if (const double speed = std::hypot(vx, vy); speed > 150.0 && speed < 1500.0 && distance < 400.0) {
+						const double behind = (dx * vx + dy * vy) / speed;
+						rate                = std::clamp(1.0 - behind / 500.0, 0.6, 1.2);
+					}
+				}
+				double add_rx = 0.0, add_ry = 0.0, add_lx = 0.0, add_ly = 0.0;
+				if (std::fabs(turn) > TurnBand) {
+					add_rx = std::clamp(TurnRate * turn / gains.yaw, -0.6, 0.6);
+				}
+				if (std::fabs(tilt) > TurnBand) {
+					add_ry = std::clamp(TurnRate * tilt / gains.pitch, -0.6, 0.6);
+				}
+				// (A cut of the camera, a fall or a death puts it far from the path in a frame:
+				// walking there in a straight line is no use, the sticks stay the session's.)
+				if (distance > WalkBand && distance < 3000.0) {
+					// (Up to more than a full push: a player ahead of the path has to be stopped
+					// and walked back against the session's stick.)
+					constexpr double Most = 1.6;
+					add_lx                = std::clamp(WalkRate * side / gains.right, -Most, Most);
+					add_ly                = std::clamp(-WalkRate * ahead / gains.forward, -Most, Most);
+				}
+				if (correct) {
+					AddCorrection(out[0], out[1], add_lx, add_ly, 0.28, out[0], out[1]);
+					AddCorrection(out[2], out[3], add_rx, add_ry, 0.22, out[2], out[3]);
+				}
+				// Off the path for half a second (a ledge missed, a way round an obstacle, a fall
+				// onto another level): where the player stands on a part of the path the session
+				// passed in the last seconds, or is about to, the session's clock is set to that
+				// part, and what the session did from there on is done from there. The latest such
+				// part, on the same level (the camera's height tells), and not the same one over
+				// and over.
+				const double height = target.position[2] - now.position[2];
+				if (distance > 250.0 || std::fabs(height) > 400.0) {
+					off_since = off_since < 0.0 ? elapsed : off_since;
+				} else {
+					off_since = -1.0;
+				}
+				if (correct && off_since >= 0.0 && elapsed - off_since > 0.5 && elapsed >= next_seek && seeks < 40) {
+					next_seek   = elapsed + 1.0;
+					double best = -1.0;
+					for (const auto& point: session.path) {
+						if (point.time < time - 10.0) {
+							continue;
+						}
+						if (point.time > time + 1.5) {
+							break;
+						}
+						if (std::hypot(point.position[0] - now.position[0], point.position[1] - now.position[1]) < 150.0 &&
+						    std::fabs(point.position[2] - now.position[2]) < 150.0) {
+							best = point.time;
+						}
+					}
+					if (best >= 0.0 && std::fabs(best - time) > 0.3) {
+						same_seeks = std::fabs(best - last_seek_to) < 1.0 ? same_seeks + 1 : 0;
+						if (same_seeks < 3) {
+							LOGF("Replay track: %.0f s, %.0f units off the path at session %.1f s; the player stands "
+							     "where the session was at %.1f s: on from there\n",
+							     elapsed, distance, played, best - from);
+							last_seek_to = best;
+							seeks++;
+							seek(best);
+							off_since = -1.0;
+							next_seek = elapsed + 2.0;
+						}
+					}
+				}
+				if (distance <= 300.0 && std::fabs(height) <= 400.0) {
+					last_near = played;
+				}
+				if (camera.frames != seen_frames) {
+					seen_frames = camera.frames;
+					compared++;
+					sum_distance += distance;
+					sum_turn += std::fabs(turn);
+					max_distance = std::max(max_distance, distance);
+					max_turn     = std::max(max_turn, std::fabs(turn));
+					far_frames += distance > 300.0 ? 1 : 0;
+				}
+				if (elapsed >= next_report) {
+					next_report = std::floor(elapsed) + 1.0;
+					LOGF("Replay track: %.0f s (session %.1f s), %.0f units off the path (%.0f ahead, %.0f to "
+					     "the side, %.0f up), %.1f deg turn, %.1f deg tilt; sticks L %+.2f %+.2f R %+.2f %+.2f\n",
+					     elapsed, played, distance, ahead, side, height, turn * 57.2958, tilt * 57.2958, out[0],
+					     out[1], out[2], out[3]);
+				}
+			} else if (elapsed >= next_report) {
+				next_report = std::floor(elapsed) + 1.0;
+				LOGF("Replay track: %.0f s (session %.1f s), %s\n", elapsed, played,
+				     fresh ? "the session has no camera here" : "no camera in this frame");
+			}
+		}
+		for (int axis = 0; axis < 6; axis++) {
+			const int value = axis < 4 ? static_cast<int>(std::lround(out[axis] * 32767.0))
+			                           : static_cast<int>(base[axis]);
+			if (std::abs(value - sent[axis]) >= 160 || (value == 0 && sent[axis] != 0)) {
+				sent[axis] = value;
+				g_hooks.replay_axis(axis, value);
+			}
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(4));
+	}
+	const double waited = std::chrono::duration<double>(Clock::now() - start).count() - (played - lead);
+	// Nothing stays held: sticks to the centre, triggers and buttons released.
+	for (int axis = 0; axis < 6; axis++) {
+		g_hooks.replay_axis(axis, 0);
+	}
+	for (int button = 0; button < 64; button++) {
+		if ((down & (uint64_t {1} << button)) != 0) {
+			g_hooks.replay_button(button, false);
+		}
+	}
+	std::string tracked;
+	if (compared != 0) {
+		tracked = Format("; off the path by %.0f units and %.1f deg on average, %.0f and %.1f at most, "
+		                 "more than 300 units in %.0f%% of %" PRIu64 " frames; on the path until %.0f s of "
+		                 "the session's %.0f, %.1f s longer than the session, set to another part "
+		                 "of the path %d times",
+		                 sum_distance / static_cast<double>(compared),
+		                 sum_turn / static_cast<double>(compared) * 57.2958, max_distance,
+		                 max_turn * 57.2958,
+		                 100.0 * static_cast<double>(far_frames) / static_cast<double>(compared), compared,
+		                 last_near, played, waited, seeks);
+	}
+	Log::WriteToConsoleAndLog(Format(
+	    "LIVE replay end: %zu of %zu events played in %.1f s%s\n", done, events.size(),
+	    std::chrono::duration<double>(Clock::now() - start).count(), tracked.c_str()));
+}
+
+void Replay(uint64_t id, const std::vector<std::string>& words) {
+	if (g_hooks.replay_axis == nullptr || g_hooks.replay_button == nullptr) {
+		Answer(Format("LIVE error id=%" PRIu64 " replay: not available", id));
+		return;
+	}
+	const auto run = g_replay_run.fetch_add(1, std::memory_order_acq_rel) + 1;
+	for (int i = 0; i < 2000 && g_replay_live.load(std::memory_order_acquire) != 0; i++) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	if (words.size() < 3 || words[1] == "stop") {
+		Answer(Format("LIVE replay id=%" PRIu64 " stopped", id));
+		return;
+	}
+	const double from      = std::strtod(words[2].c_str(), nullptr);
+	const bool   on_camera = std::find(words.begin() + 3, words.end(), "oncamera") != words.end();
+	const double seconds =
+	    words.size() > 3 && words[3] != "oncamera" ? std::strtod(words[3].c_str(), nullptr) : 0.0;
+	auto session = ReadSession(words[1], from, seconds);
+	if (session.events.empty()) {
+		Answer(Format("LIVE error id=%" PRIu64 " replay: no gamepad events from %.3f on in %s", id,
+		              from, words[1].c_str()));
+		return;
+	}
+	Answer(Format("LIVE replay id=%" PRIu64 " events=%zu from=%.3f to=%.3f camera_frames=%zu", id,
+	              session.events.size(), session.events.front().time, session.events.back().time,
+	              session.path.size()));
+	g_replay_live.fetch_add(1, std::memory_order_acq_rel);
+	std::thread(ReplayThread, run, std::move(session), from, on_camera).detach();
+}
+
+// ---------------------------------------------------------------------------------------------
 // The command file
 
 std::vector<std::string> Words(const std::string& line) {
@@ -1235,6 +1825,8 @@ void Execute(uint64_t id, const std::string& line) {
 		Answer(list);
 	} else if (command == "mem") {
 		Mem(id, words);
+	} else if (command == "replay" && words.size() >= 2) {
+		Replay(id, words);
 	} else if (command == "pad" && words.size() >= 2) {
 		Pad(id, words[1], static_cast<int>(number(2, 120.0)));
 	} else if (command == "stick" && words.size() == 6 && g_hooks.pad_sticks != nullptr) {
@@ -1342,6 +1934,31 @@ Counter::Counter(const char* name) noexcept: m_name(name), m_next(g_counters) {
 
 void SetHostHooks(const HostHooks& hooks) noexcept {
 	g_hooks = hooks;
+}
+
+void NoteCamera(const float* position, const float* forward) noexcept {
+	const double time = g_hooks.input_seconds != nullptr ? g_hooks.input_seconds() : 0.0;
+	{
+		const std::lock_guard lock(g_camera_mutex);
+		const bool            on = g_camera.frames == 0 || time - g_camera.time >= 0.7;
+		g_camera.time            = time;
+		for (int i = 0; i < 3; i++) {
+			g_camera.position[i] = static_cast<double>(position[i]);
+			g_camera.forward[i]  = static_cast<double>(forward[i]);
+		}
+		if (on) {
+			g_camera.run_start = time;
+			std::copy_n(g_camera.position, 3, g_camera.run_position);
+			std::copy_n(g_camera.forward, 3, g_camera.run_forward);
+		}
+		g_camera.frames++;
+	}
+	if (g_path_log.On()) {
+		LOGF("Camera: %.2f, %.2f, %.2f, %.5f, %.5f, %.5f, time = %.4f\n",
+		     static_cast<double>(position[0]), static_cast<double>(position[1]),
+		     static_cast<double>(position[2]), static_cast<double>(forward[0]),
+		     static_cast<double>(forward[1]), static_cast<double>(forward[2]), time);
+	}
 }
 
 void Detail::NoteGuestWait(const char* kind, uint64_t address, uint64_t bytes, int64_t begin_ns,

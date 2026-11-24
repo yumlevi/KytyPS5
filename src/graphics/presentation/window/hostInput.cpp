@@ -622,7 +622,10 @@ void ApplyPadControl(int id, std::size_t control, std::size_t source, bool down)
 	}
 	const auto& info = CONTROL_INFO[control];
 	if (info.gyro) {
-		if (down) {
+		// (A replayed press comes on the host-input pad and is no toggle of the emulator's: on the
+		// session's own pad it did what that pad does, and here it would take the right stick
+		// away from the replay.)
+		if (down && id != Controller::HOST_INPUT_CONTROLLER_ID) {
 			Controller::ToggleGyroEmulation(id);
 		}
 	} else if (info.touchpad_mode) {

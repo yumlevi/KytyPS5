@@ -19,6 +19,21 @@
 //   set <switch> <value>           a live switch (Switch below); `switches` lists them
 //   pad <button> [ms]              press and release a controller button (cross, circle, up, ...)
 //   stick <lx> <ly> <rx> <ry> <ms> hold the sticks (0..255, 128 centred), then centre them
+//   replay <log> <from> [seconds]  play the gamepad events of a session's log (its "Controller
+//                                  axis:" and "Controller button:" lines) from the event time
+//                                  <from> on, each as long after this command as it came after
+//                                  <from> then; other commands go on meanwhile. `replay stop`
+//                                  ends it. Played by the clock alone the game leaves the
+//                                  session's course within seconds (a stick held a frame longer
+//                                  turns the camera a few degrees further, and every later step
+//                                  goes that much wrong), so where the log has the camera's path
+//                                  (its "Camera:" lines) the sticks are corrected towards it: the
+//                                  camera is turned to where it looked then and the player walked
+//                                  to where they stood then. "Replay track:" lines tell how far
+//                                  off the path it is. With `oncamera` as the last word the
+//                                  session's clock starts with the level's first frame (the camera
+//                                  coming on after the loading screen) instead of with the
+//                                  command: <from> is that frame's time in the log.
 //   sleep <ms>                     wait before the next command
 //   wait [seconds]                 wait (at most that long, default 300) until the emulator has no
 //                                  shader translation or pipeline build left that it runs ahead of
@@ -91,8 +106,20 @@ struct HostHooks {
 	                                    uint64_t* scanned) = nullptr;
 	// The guest's own threads, as host thread ids and names (for the CPU times of a hitch line).
 	std::vector<std::pair<uint64_t, std::string>> (*guest_threads)() = nullptr;
+	// One gamepad event as a session's log has it (SDL's axis or button number and value), for
+	// `replay`: translated as the live event was.
+	void (*replay_axis)(int axis, int value)      = nullptr;
+	void (*replay_button)(int button, bool down) = nullptr;
+	// The window's event clock in seconds: the time base of the log's input lines.
+	double (*input_seconds)() = nullptr;
 };
 void SetHostHooks(const HostHooks& hooks) noexcept;
+
+// The game's camera in the frame being rendered, as its view constants have it (the renderer's
+// thread, once a frame): its position in the world and the direction it looks in. Goes to the log
+// as a "Camera:" line with the event clock's time (path_log 0: not), so that a session's log
+// holds the path the player took beside what they pressed, and is what `replay` steers by.
+void NoteCamera(const float* position, const float* forward) noexcept;
 
 // Starts the command thread when KYTY_LIVE_FILE names a command file.
 void Start();
