@@ -81,6 +81,13 @@ public:
 	[[nodiscard]] const Slot& GetSlot(uint32_t slot) const { return m_slots[slot]; }
 	[[nodiscard]] uint32_t    SlotCount() const { return static_cast<uint32_t>(m_slots.size()); }
 	void                      Translate(uint32_t entry, uint32_t slot);
+	// The entry goes to `slot` from whatever it held (its record names another image now), in
+	// one write: work in flight reads the old slot or the new one, never a pending entry.
+	// Returns the image slot the entry left, which stays in use, also without an entry, until
+	// its owner frees it; NoSlot when it held none (pending, the placeholder) or held `slot`.
+	uint32_t Retranslate(uint32_t entry, uint32_t slot);
+	// What the entry holds: a slot, or IR::BindlessPending.
+	[[nodiscard]] uint32_t EntryValue(uint32_t entry) const { return m_entries[entry]; }
 	// The slot's entries become pending again (its image is gone).
 	void FreeSlot(uint32_t slot);
 	// Drops every heap and region: all entries become pending and the next heap starts at

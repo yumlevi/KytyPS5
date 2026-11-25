@@ -527,8 +527,17 @@ private:
 	void                      CommitBindlessImages(const PreparedBindings& prepared,
 	                                               vk::CommandBuffer       vk_buffer);
 	void                      ValidateBindlessSlots();
+	// Why a key has the placeholder (ResolveBindlessKey).
+	enum class BindlessRefusal : uint8_t {
+		None,  // It has an image.
+		Final, // Its T# names no texture, or one the heap's image cannot bind: until it changes.
+		Retry, // Memory, an image at the address or a free slot was missing: may pass later.
+	};
+	// `words`: the T# the key's record held (zeros when it could not be read).
 	[[nodiscard]] uint32_t    ResolveBindlessKey(uint32_t                            heap,
-	                                             const BindlessTranslation::Request& request);
+	                                             const BindlessTranslation::Request& request,
+	                                             std::array<uint32_t, 8>*            words   = nullptr,
+	                                             BindlessRefusal*                    refusal = nullptr);
 	void                      FillBindlessHeap(uint32_t heap);
 	void                      ResetFullBindlessTable();
 	[[nodiscard]] bool TryConsumeComputeFill(const ShaderComputeInputInfo& input,
@@ -598,8 +607,52 @@ private:
 		uint32_t slot  = 0;
 		ImageId  image;
 		uint64_t serial = 0;
+		// The T# it was resolved from, and the slot's view then.
+		std::array<uint32_t, 8> words {};
+		uint64_t                view = 0;
 	};
 	std::unordered_map<uint64_t, std::vector<BindlessResolved>> m_bindless_resolved;
+	// The keys that have a translation, per heap that is a table of T#s, each with the T# it
+	// was made from (RevalidateBindlessRecords looks whether the record still holds it).
+	struct BindlessWatched {
+		uint32_t                record  = 0;
+		uint32_t                layer   = 0;
+		BindlessRefusal         refusal = BindlessRefusal::None;
+		std::array<uint32_t, 8> words {};
+	};
+	struct BindlessWatch {
+		std::vector<BindlessWatched> keys;
+		// record * layers + layer -> the key's place in `keys`.
+		std::unordered_map<uint32_t, uint32_t> places;
+		// Watched keys per 64 KiB piece of the heap's records.
+		std::vector<uint32_t> pieces;
+		// Where the last watched T# ends, from the heap's base.
+		uint64_t end = 0;
+		// A draw or dispatch used the heap since its keys were last looked at, and the frames
+		// it was used in so far (counted up to the number from which it is looked at in every
+		// frame, used or not).
+		bool    used   = false;
+		uint8_t frames = 0;
+		// The first key the retry of placeholders has not come to; SIZE_MAX: no retry is due.
+		size_t retry_from = SIZE_MAX;
+	};
+	std::vector<BindlessWatch> m_bindless_watch;
+	std::vector<uint8_t>       m_bindless_scratch;
+	std::vector<uint8_t>       m_bindless_piece_read;
+	uint32_t                   m_bindless_retry_frames = 0;
+	// The slots the keys of rewritten records left with nothing translated to them: given back
+	// some passes later, if nothing was translated to them since.
+	struct BindlessLeft {
+		uint32_t slot = 0;
+		ImageId  image;
+		uint64_t serial = 0;
+		uint64_t pass   = 0;
+	};
+	std::vector<BindlessLeft> m_bindless_left;
+	uint64_t                  m_bindless_passes = 0;
+	void WatchBindlessKey(uint32_t heap, uint32_t record, uint32_t layer,
+	                      const std::array<uint32_t, 8>& words, BindlessRefusal refusal);
+	void RevalidateBindlessRecords();
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

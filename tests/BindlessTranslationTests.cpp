@@ -103,6 +103,51 @@ void TestHeapsAndKeys() {
         "regions are appended");
 }
 
+// A key whose record the game rewrote goes to the slot of what the record
+// names now, in one write: the old slot keeps its image and its other entries,
+// and stays in use without any until its owner gives it back.
+void TestRetranslate() {
+  std::vector<uint32_t> entries(64, 0);
+  BindlessTranslation table(entries, 4);
+  const auto heap = table.FindOrCreateHeap(Key(0x1000), 3);
+  const auto region = table.GetHeap(heap).region;
+  const auto first = table.AllocateSlot(Common::SlotId{5}, 50, 0);
+  const auto second = table.AllocateSlot(Common::SlotId{6}, 60, 0);
+  table.Translate(region + 1, first);
+  table.Translate(region + 2, first);
+  table.Translate(region + 3, BindlessTranslation::PlaceholderSlot);
+  Check(table.Retranslate(region + 1, second) == first &&
+            entries[region + 1] == second && entries[region + 2] == first &&
+            table.GetSlot(first).entries == std::vector<uint32_t>{region + 2} &&
+            table.GetSlot(second).entries == std::vector<uint32_t>{region + 1},
+        "a retranslated entry leaves its slot, which keeps the other entry");
+  Check(table.Retranslate(region + 1, second) == BindlessTranslation::NoSlot &&
+            table.GetSlot(second).entries.size() == 1,
+        "retranslating to the slot an entry has changes nothing");
+  Check(table.Retranslate(region + 3, second) == BindlessTranslation::NoSlot &&
+            entries[region + 3] == second &&
+            table.Retranslate(region + 3, BindlessTranslation::PlaceholderSlot) ==
+                second &&
+            table.EntryValue(region + 3) == BindlessTranslation::PlaceholderSlot &&
+            table.GetSlot(second).entries == std::vector<uint32_t>{region + 1},
+        "an entry goes from the placeholder to a slot and back");
+  Check(table.Retranslate(region + 5, second) == BindlessTranslation::NoSlot &&
+            entries[region + 5] == second,
+        "a pending entry takes the slot");
+  BindlessTranslation::Request request;
+  Check(!table.Decode(region + 1, request),
+        "a retranslated entry is never pending");
+  Check(table.Retranslate(region + 2, second) == first &&
+            table.GetSlot(first).InUse() &&
+            table.GetSlot(first).entries.empty(),
+        "a slot every entry left is in use, with no entries");
+  table.FreeSlot(first);
+  Check(!table.GetSlot(first).InUse() && entries[region + 2] == second &&
+            table.AllocateSlot(Common::SlotId{7}, 70, 0) == first,
+        "a slot given back is allocated again, the entries that left it "
+        "untouched");
+}
+
 // Heaps keyed by per-frame addresses fill the append-only table; a reset (with
 // no GPU work in flight) must make room again without forgetting which images
 // the slots hold.
@@ -152,6 +197,7 @@ void TestReset() {
 
 int main() {
   TestHeapsAndKeys();
+  TestRetranslate();
   TestReset();
   std::printf("BindlessTranslationTests: all tests passed\n");
   return 0;

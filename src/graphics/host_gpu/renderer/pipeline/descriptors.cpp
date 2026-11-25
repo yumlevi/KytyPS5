@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
+#include "common/debugCounters.h"
 #include "common/file.h"
 #include "common/liveControl.h"
 #include "common/logging/log.h"
@@ -32,8 +33,11 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
+#include <cstring>
 #include <fmt/format.h>
 #include <limits>
 #include <optional>
@@ -1313,6 +1317,27 @@ Common::LiveControl::Counter g_bindless_refused_class("bindless_refused_class");
 Common::LiveControl::Counter g_bindless_refused_other("bindless_refused_other");
 Common::LiveControl::Counter g_bindless_other_kind("bindless_other_kind");
 Common::LiveControl::Switch  g_bindless_log("bindless_log", 0);
+// 1: a key whose record the game rewrote is resolved again, to what the record names now; and
+// every bindless_retry flips (0: never) the keys that got the placeholder for something that may
+// have come since (memory, an image, a free slot) are resolved again. 0: a translation stays for
+// the session. (Set at the start, KYTY_BINDLESS_REVALIDATE: the keys translated while it is 0
+// are not watched afterwards.)
+Common::LiveControl::Switch  g_bindless_revalidate("bindless_revalidate", 1);
+Common::LiveControl::Switch  g_bindless_retry("bindless_retry", 30);
+// Watched keys whose record changed; of those and of the keys tried again, the ones that went to
+// another slot (or to or from the placeholder); the keys tried again; the time of the look.
+Common::LiveControl::Counter g_bindless_records_changed("bindless_records_changed");
+Common::LiveControl::Counter g_bindless_moved("bindless_moved");
+Common::LiveControl::Counter g_bindless_retried("bindless_retried");
+Common::LiveControl::Counter g_bindless_revalidate_us("bindless_revalidate_us");
+// The slots in use (their number, in a measure line's per-frame figure) and the slots given
+// back after the keys of rewritten records had left them; the heaps of the draws and dispatches
+// that sample through the table.
+Common::LiveControl::Counter g_bindless_heap_uses("bindless_heap_uses");
+Common::LiveControl::Counter g_bindless_slots_used("bindless_slots_used");
+// What the refresh of the slots' images uploads a frame (ResolveBindlessImages), in KiB.
+Common::LiveControl::Counter g_bindless_refresh_kb("bindless_refresh_kb");
+Common::LiveControl::Counter g_bindless_slots_freed("bindless_slots_freed");
 } // namespace
 
 // A heap is the records of one V# a stage reaches T#s through (ResourceSnapshot::BindlessUse);
@@ -1444,6 +1469,11 @@ void RenderExecutor::CommitBindlessImages(const PreparedBindings& prepared,
 		ValidateBindlessSlots();
 	}
 	for (const auto heap: prepared.bindless_heaps) {
+		// (Its watched keys are looked at when the frame ends: RevalidateBindlessRecords.)
+		g_bindless_heap_uses.Add();
+		if (heap < m_bindless_watch.size()) {
+			m_bindless_watch[heap].used = true;
+		}
 		for (const auto slot: translation.GetHeap(heap).slots) {
 			auto& image = cache.GetImage(translation.GetSlot(slot).image);
 			if (image.binding.is_target) continue;
@@ -1481,7 +1511,21 @@ void RenderExecutor::ValidateBindlessSlots() {
 // The slot of the T# a key names: the record's pointer, then the layer's T# behind it, read
 // from guest memory as the shader would. Anything unreadable or unsupported is the placeholder.
 uint32_t RenderExecutor::ResolveBindlessKey(uint32_t                            heap,
-                                            const BindlessTranslation::Request& request) {
+                                            const BindlessTranslation::Request& request,
+                                            std::array<uint32_t, 8>*            words,
+                                            BindlessRefusal*                    refusal) {
+	if (words != nullptr) {
+		words->fill(0);
+	}
+	if (refusal != nullptr) {
+		*refusal = BindlessRefusal::None;
+	}
+	const auto refused = [&](BindlessRefusal why) {
+		if (refusal != nullptr) {
+			*refusal = why;
+		}
+		return BindlessTranslation::PlaceholderSlot;
+	};
 	auto&       table       = m_context.GetBindlessTable();
 	auto&       translation = table.Translation();
 	const auto& key         = translation.GetHeap(heap).key;
@@ -1496,15 +1540,21 @@ uint32_t RenderExecutor::ResolveBindlessKey(uint32_t                            
 		// The shader sign-extends bit 47; the bits above it carry what the game stores there.
 		pointer = static_cast<uint64_t>(static_cast<int64_t>(pointer << 16u) >> 16u);
 		if (!readable || pointer == 0) {
-			return BindlessTranslation::PlaceholderSlot;
+			return refused(BindlessRefusal::Retry);
 		}
 	}
 	ShaderRecompiler::IR::DescriptorValue value;
 	value.dword_count = static_cast<uint32_t>(value.dwords.size());
 	const auto descriptor = pointer + uint64_t {request.layer} * key.layer_stride + key.table_offset;
-	if (!LibKernel::Memory::TryReadBacking(descriptor, value.dwords.data(), sizeof(value.dwords)) ||
-	    DecodeNativeDescriptor<ShaderTextureResource>(value).IsNull()) {
-		return BindlessTranslation::PlaceholderSlot;
+	if (!LibKernel::Memory::TryReadBacking(descriptor, value.dwords.data(), sizeof(value.dwords))) {
+		return refused(BindlessRefusal::Retry);
+	}
+	// (Whatever comes of it: a record that names no texture is watched with what it holds.)
+	if (words != nullptr) {
+		std::ranges::copy(value.dwords, words->begin());
+	}
+	if (DecodeNativeDescriptor<ShaderTextureResource>(value).IsNull()) {
+		return refused(BindlessRefusal::Final);
 	}
 	EXIT_IF(heap >= m_bindless_resources.size());
 	// A T# a plain binding would refuse keeps the placeholder: the key may name a record the
@@ -1524,7 +1574,7 @@ uint32_t RenderExecutor::ResolveBindlessKey(uint32_t                            
 			     value.dwords[0], value.dwords[1], value.dwords[2], value.dwords[3],
 			     value.dwords[4], value.dwords[5], value.dwords[6], value.dwords[7]);
 		}
-		return BindlessTranslation::PlaceholderSlot;
+		return refused(BindlessRefusal::Final);
 	}
 	auto& cache   = m_context.GetTextureCache();
 	auto  binding = ResolveTexture(m_bindless_resources[heap], value, TextureSource::Optional);
@@ -1533,9 +1583,12 @@ uint32_t RenderExecutor::ResolveBindlessKey(uint32_t                            
 		const auto& made   = m_bindless_resources[heap];
 		const bool  fits   = TextureTypeFitsDimension(type, made.dimension);
 		const auto  format = tsharp.Format();
+		// (A 32-bit integer T# is the float image's to bind: the bits view of ResolveTexture.)
 		const bool  same_class =
 		    made.numeric_class ==
-		    Prospero::SampledTextureNumericClass(Prospero::RemapTextureFormat(format));
+		        Prospero::SampledTextureNumericClass(Prospero::RemapTextureFormat(format)) ||
+		    (g_bindless_bits.On() && made.numeric_class == Prospero::TextureNumericClass::Float &&
+		     ShaderRecompiler::IR::RawViewOf(format).mode == ShaderRecompiler::IR::RawView::Bits);
 		(!fits ? g_bindless_refused_dimension : !same_class ? g_bindless_refused_class
 		                                                     : g_bindless_refused_other)
 		    .Add();
@@ -1554,12 +1607,14 @@ uint32_t RenderExecutor::ResolveBindlessKey(uint32_t                            
 			     static_cast<uint32_t>(made.resource_class),
 			     !fits ? "another dimension" : !same_class ? "another numeric class" : "other");
 		}
-		return BindlessTranslation::PlaceholderSlot;
+		// (Only the dimension is the T#'s alone to decide; the other checks include the
+		// texture's memory and the image at its address.)
+		return refused(!fits ? BindlessRefusal::Final : BindlessRefusal::Retry);
 	}
 	g_bindless_resolved.Add();
 	auto& image = cache.GetImage(binding.image_id);
 	if (image.info.IsDepth() || image.info.data.Empty()) {
-		return BindlessTranslation::PlaceholderSlot;
+		return refused(BindlessRefusal::Retry);
 	}
 	const auto view = cache.FindTexture(binding.image_id, binding.desc);
 	const auto handle = reinterpret_cast<uint64_t>(static_cast<VkImageView>(view));
@@ -1567,21 +1622,37 @@ uint32_t RenderExecutor::ResolveBindlessKey(uint32_t                            
 	if (slot == BindlessTranslation::NoSlot) {
 		slot = translation.AllocateSlot(binding.image_id, image.serial, handle);
 		if (slot == BindlessTranslation::NoSlot) {
+			// Every slot is taken: the ones nothing is translated to are given back (their heaps
+			// were dropped and not drawn since, or the keys of rewritten records left them).
+			for (uint32_t taken = BindlessTranslation::PlaceholderSlot + 1u;
+			     taken < translation.SlotCount(); ++taken) {
+				if (const auto& idle = translation.GetSlot(taken);
+				    idle.InUse() && idle.entries.empty()) {
+					table.WriteSlot(taken, nullptr, vk::ImageLayout::eGeneral);
+					translation.FreeSlot(taken);
+					g_bindless_slots_freed.Add();
+				}
+			}
+			slot = translation.AllocateSlot(binding.image_id, image.serial, handle);
+		}
+		if (slot == BindlessTranslation::NoSlot) {
 			static bool reported = false;
 			if (!std::exchange(reported, true)) {
 				LOGF("bindless image slots are exhausted; later keys sample the placeholder\n");
 			}
-			return BindlessTranslation::PlaceholderSlot;
+			return refused(BindlessRefusal::Retry);
 		}
 		table.WriteSlot(slot, view, vk::ImageLayout::eShaderReadOnlyOptimal);
 	}
 	auto&      resolved = m_bindless_resolved[pointer + key.table_offset];
 	const auto layer    = std::ranges::find(resolved, request.layer, &BindlessResolved::layer);
+	BindlessResolved made {request.layer, slot, binding.image_id, image.serial, {}, handle};
+	std::ranges::copy(value.dwords, made.words.begin());
 	if (layer == resolved.end()) {
-		resolved.push_back({request.layer, slot, binding.image_id, image.serial});
+		resolved.push_back(made);
 	} else {
 		// The key resolved before to an image that has gone since.
-		*layer = {request.layer, slot, binding.image_id, image.serial};
+		*layer = made;
 	}
 	return slot;
 }
@@ -1606,10 +1677,13 @@ void RenderExecutor::FillBindlessHeap(uint32_t heap) {
 		for (const auto& entry: resolved->second) {
 			const auto& slot = translation.GetSlot(entry.slot);
 			if (entry.layer >= key.layer_count || !slot.InUse() || slot.image != entry.image ||
-			    slot.serial != entry.serial) {
+			    slot.serial != entry.serial || slot.view != entry.view) {
 				continue;
 			}
 			translation.Translate(found.region + record * key.layer_count + entry.layer, entry.slot);
+			// (Watched with the T# this was resolved from: a record of a table that holds
+			// another by now is resolved again when the frame ends.)
+			WatchBindlessKey(heap, record, entry.layer, entry.words, BindlessRefusal::None);
 			filled = true;
 		}
 	}
@@ -1637,7 +1711,257 @@ void RenderExecutor::ResetFullBindlessTable() {
 	m_context.GetCommandScheduler().Finish();
 	table.Reset();
 	m_bindless_resources.clear();
+	m_bindless_watch.clear();
+	m_bindless_left.clear();
 	m_bindless_heap_refused = false;
+}
+
+// A translation (key -> slot) is made when a shader first flags the key, from the T# the key's
+// record holds then, and nothing made it again: a record the game filled in a few frames after
+// its first use (a texture that was still loading: the key had got the placeholder), or gave to
+// another texture, kept sampling what it named at that first look for the rest of the session.
+// Saros writes some 160 records of its table of all textures every frame (its sparse volume
+// textures take new pages and tiles as they play): the volumes an eclipse brings were drawn as
+// flat boxes of whatever their first textures' memory held by then, in any session that saw
+// the eclipse begin, and right after a restart from the same save.
+//
+// So the keys that have a translation are watched, each with the T# it was made from, in the
+// heaps that are tables of T#s (a record holds one). Not in the heaps that reach their T#s
+// through a pointer per record, nor in an image heap taken by its DWORDs: the games that have
+// those build them anew for every frame or draw, and FillBindlessHeap gives a new heap what
+// was resolved.
+// Once a frame the pieces of the table that hold watched keys are read (of a table that a few
+// frames have used: from then on in every frame, since a game does not draw through its table
+// in every frame and rewrites records between; a table that lived for a frame or two is left
+// alone after it), and a key whose record no longer holds its T# is resolved again there and then,
+// from what the record names now: its entry goes from the old slot to the new one in one
+// write. (Made pending instead, it would sample the placeholder until the shader's flag had
+// come back: a frame or two of nothing at every rewrite, and nothing at all for a record
+// rewritten every frame.) Up to a number of keys a frame; the others keep their translation
+// until the next.
+// The slot such a key left stays in the table, its image refreshed every frame and kept from
+// the cache's collector: when nothing has been translated to it some frames later (work in
+// flight may still sample it), it is given back.
+// A key that holds the placeholder because something was missing when it was asked for (its
+// texture's memory not mapped yet, another image at its address, no free slot) is resolved
+// again every bindless_retry frames. One whose T# itself cannot be bound keeps the placeholder
+// until its record changes.
+void RenderExecutor::WatchBindlessKey(uint32_t heap, uint32_t record, uint32_t layer,
+                                      const std::array<uint32_t, 8>& words,
+                                      BindlessRefusal                refusal) {
+	if (!g_bindless_revalidate.On()) {
+		return;
+	}
+	const auto& key = m_context.GetBindlessTable().Translation().GetHeap(heap).key;
+	if (key.pointer_offset != ShaderRecompiler::IR::BindlessUse::NoPointer ||
+	    key.record_stride < sizeof(words)) {
+		return;
+	}
+	if (m_bindless_watch.size() <= heap) {
+		m_bindless_watch.resize(heap + 1u);
+	}
+	auto&      watch = m_bindless_watch[heap];
+	const auto place = record * key.layer_count + layer;
+	if (const auto found = watch.places.find(place); found != watch.places.end()) {
+		watch.keys[found->second].words   = words;
+		watch.keys[found->second].refusal = refusal;
+		return;
+	}
+	const auto offset = uint64_t {record} * key.record_stride +
+	                    uint64_t {layer} * key.layer_stride + key.table_offset;
+	// (A T# that crosses into the next piece counts in both.)
+	const auto last = (offset + sizeof(words) - 1u) >> 16u;
+	if (watch.pieces.size() <= last) {
+		watch.pieces.resize(last + 1u, 0u);
+	}
+	for (auto piece = offset >> 16u; piece <= last; ++piece) {
+		watch.pieces[piece]++;
+	}
+	watch.end = std::max(watch.end, offset + sizeof(words));
+	watch.places.emplace(place, static_cast<uint32_t>(watch.keys.size()));
+	watch.keys.push_back({record, layer, refusal, words});
+	// (Looked at when this frame ends, whether or not the heap is drawn again before.)
+	watch.used = true;
+}
+
+void RenderExecutor::RevalidateBindlessRecords() {
+	if (!g_bindless_revalidate.On() || m_bindless_watch.empty()) {
+		return;
+	}
+	const auto begin       = std::chrono::steady_clock::now();
+	auto&      table       = m_context.GetBindlessTable();
+	auto&      translation = table.Translation();
+	const auto pass        = ++m_bindless_passes;
+	// The slots left LeftSlotPasses ago or earlier.
+	constexpr uint64_t LeftSlotPasses = 8;
+	size_t             kept           = 0;
+	for (size_t i = 0; i < m_bindless_left.size(); ++i) {
+		const auto left = m_bindless_left[i];
+		if (pass - left.pass < LeftSlotPasses) {
+			m_bindless_left[kept++] = left;
+			continue;
+		}
+		const auto& slot = translation.GetSlot(left.slot);
+		if (slot.InUse() && slot.image == left.image && slot.serial == left.serial &&
+		    slot.entries.empty()) {
+			table.WriteSlot(left.slot, nullptr, vk::ImageLayout::eGeneral);
+			translation.FreeSlot(left.slot);
+			g_bindless_slots_freed.Add();
+		}
+	}
+	m_bindless_left.resize(kept);
+	const auto retry_after = static_cast<uint32_t>(g_bindless_retry.Get());
+	const bool retry       = retry_after != 0 && ++m_bindless_retry_frames >= retry_after;
+	if (retry) {
+		m_bindless_retry_frames = 0;
+		for (auto& watch: m_bindless_watch) {
+			watch.retry_from = 0;
+		}
+	}
+	// Keys resolved in a pass: each costs what a flagged key costs, some 25 us where its image
+	// is new (the 215 keys of an eclipse's start in one pass: 5.6 ms). The rest keep their
+	// translation for another frame.
+	constexpr uint32_t MaxResolved = 64;
+	// Frames of use from which a heap is looked at in every frame.
+	constexpr uint8_t PersistentFrames = 3;
+	uint32_t          resolved         = 0;
+	for (uint32_t heap = 0; heap < m_bindless_watch.size(); ++heap) {
+		auto&      watch = m_bindless_watch[heap];
+		const bool used  = std::exchange(watch.used, false);
+		if (used && watch.frames < PersistentFrames) {
+			++watch.frames;
+		}
+		if (watch.keys.empty() || (!used && watch.frames < PersistentFrames)) continue;
+		const auto& found = translation.GetHeap(heap);
+		const auto& key   = found.key;
+		// The pieces with watched keys, as the game has them now, up to the last watched T#.
+		// (The scratch only grows: two heaps of different sizes would fill it anew each time.)
+		if (m_bindless_scratch.size() < watch.pieces.size() << 16u) {
+			m_bindless_scratch.resize(watch.pieces.size() << 16u);
+		}
+		m_bindless_piece_read.assign(watch.pieces.size(), 0u);
+		for (size_t piece = 0; piece < watch.pieces.size(); ++piece) {
+			const auto from = uint64_t {piece} << 16u;
+			if (watch.pieces[piece] == 0u || from >= watch.end) continue;
+			const auto size = std::min<uint64_t>(uint64_t {1} << 16u, watch.end - from);
+			m_bindless_piece_read[piece] = LibKernel::Memory::TryReadBacking(
+			    key.base + from, m_bindless_scratch.data() + from, size);
+		}
+		// What was remembered of a key for new heaps (FillBindlessHeap) is of its old T#.
+		const auto forget = [&](const BindlessWatched& watched) {
+			const auto resolved_key = m_bindless_resolved.find(
+			    key.base + uint64_t {watched.record} * key.record_stride + key.table_offset);
+			if (resolved_key == m_bindless_resolved.end()) return;
+			std::erase_if(resolved_key->second, [&](const BindlessResolved& made) {
+				return made.layer == watched.layer;
+			});
+			if (resolved_key->second.empty()) {
+				m_bindless_resolved.erase(resolved_key);
+			}
+		};
+		size_t unretried = SIZE_MAX;
+		for (size_t i = 0; i < watch.keys.size();) {
+			const auto watched = watch.keys[i];
+			const auto offset  = uint64_t {watched.record} * key.record_stride +
+			                     uint64_t {watched.layer} * key.layer_stride + key.table_offset;
+			const auto first   = offset >> 16u;
+			const auto last    = (offset + sizeof(watched.words) - 1u) >> 16u;
+			// (A piece with a page that has no memory is not read whole: its keys one by one.)
+			std::array<uint32_t, 8> now {};
+			if (m_bindless_piece_read[first] != 0u && m_bindless_piece_read[last] != 0u) {
+				std::memcpy(now.data(), m_bindless_scratch.data() + offset, sizeof(now));
+			} else if (!LibKernel::Memory::TryReadBacking(key.base + offset, now.data(),
+			                                              sizeof(now))) {
+				++i;
+				continue;
+			}
+			const bool changed = now != watched.words;
+			const bool again   = watched.refusal == BindlessRefusal::Retry && i >= watch.retry_from;
+			if (!changed && !again) {
+				++i;
+				continue;
+			}
+			const auto place = watched.record * key.layer_count + watched.layer;
+			const auto entry = found.region + place;
+			const auto old   = translation.EntryValue(entry);
+			if (old == ShaderRecompiler::IR::BindlessPending) {
+				// Its image went (ValidateBindlessSlots): the shader flags the key at its next
+				// use, and it is watched again when it resolves.
+				if (!changed) {
+					++i;
+					continue;
+				}
+				g_bindless_records_changed.Add();
+				forget(watched);
+				for (auto piece = first; piece <= last; ++piece) {
+					watch.pieces[piece]--;
+				}
+				watch.places.erase(place);
+				if (i + 1u != watch.keys.size()) {
+					watch.keys[i] = watch.keys.back();
+					watch.places[watch.keys[i].record * key.layer_count + watch.keys[i].layer] =
+					    static_cast<uint32_t>(i);
+				}
+				watch.keys.pop_back();
+				continue;
+			}
+			if (resolved == MaxResolved) {
+				// Keeps its translation until the next frame's look, where the retry goes on.
+				watch.used = true;
+				if (again) {
+					unretried = std::min(unretried, i);
+				}
+				++i;
+				continue;
+			}
+			++resolved;
+			if (changed) {
+				g_bindless_records_changed.Add();
+				forget(watched);
+				static uint32_t reported = 0;
+				if (watched.refusal == BindlessRefusal::None && g_bindless_log.On() &&
+				    reported++ < 32u) {
+					LOGF("Bindless heap %u record %u was rewritten while its key was translated: "
+					     "%08x %08x %08x %08x %08x %08x -> %08x %08x %08x %08x %08x %08x\n",
+					     heap, watched.record, watched.words[0], watched.words[1], watched.words[2],
+					     watched.words[3], watched.words[4], watched.words[5], now[0], now[1], now[2],
+					     now[3], now[4], now[5]);
+				}
+			} else {
+				g_bindless_retried.Add();
+			}
+			// (The words it reads itself: the game may have written the record again.)
+			std::array<uint32_t, 8> words {};
+			auto                    refusal = BindlessRefusal::None;
+			const auto slot = ResolveBindlessKey(heap, {heap, watched.record, watched.layer},
+			                                     &words, &refusal);
+			if (slot != old) {
+				g_bindless_moved.Add();
+				if (const auto left = translation.Retranslate(entry, slot);
+				    left != BindlessTranslation::NoSlot) {
+					if (const auto& idle = translation.GetSlot(left);
+					    idle.InUse() && idle.entries.empty()) {
+						// (Left before, used again and left again: one record, from now.)
+						const auto before =
+						    std::ranges::find(m_bindless_left, left, &BindlessLeft::slot);
+						if (before == m_bindless_left.end()) {
+							m_bindless_left.push_back({left, idle.image, idle.serial, pass});
+						} else {
+							*before = {left, idle.image, idle.serial, pass};
+						}
+					}
+				}
+			}
+			watch.keys[i].words   = words;
+			watch.keys[i].refusal = refusal;
+			++i;
+		}
+		watch.retry_from = unretried;
+	}
+	g_bindless_revalidate_us.Add(static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+	                                                          begin)
+	        .count()));
 }
 
 void RenderExecutor::ResolveBindlessImages(CommandBuffer& buffer) {
@@ -1659,16 +1983,29 @@ void RenderExecutor::ResolveBindlessImages(CommandBuffer& buffer) {
 	}
 	// A resolved image is sampled through its slot without a lookup, so guest writes to it
 	// (streamed-in texture data) are picked up here, once per frame.
+	uint32_t   used     = 0;
+	const auto uploaded = Common::DebugCounters::Get(Common::DebugCounters::Counter::TextureUploadBytes);
 	for (uint32_t slot = BindlessTranslation::PlaceholderSlot + 1u; slot < translation.SlotCount();
 	     ++slot) {
 		if (translation.GetSlot(slot).InUse()) {
 			cache.UpdateImage(translation.GetSlot(slot).image);
+			++used;
 		}
 	}
+	g_bindless_slots_used.Add(used);
+	g_bindless_refresh_kb.Add(
+	    (Common::DebugCounters::Get(Common::DebugCounters::Counter::TextureUploadBytes) - uploaded) /
+	    1024u);
+	// (After the loop above: this resolves keys, and a lookup may delete the image of a slot.)
+	RevalidateBindlessRecords();
 	for (const auto entry: m_bindless_feedback) {
 		BindlessTranslation::Request request;
 		if (!translation.Decode(entry, request)) continue;
-		translation.Translate(entry, ResolveBindlessKey(request.heap, request));
+		std::array<uint32_t, 8> words {};
+		auto                    refusal = BindlessRefusal::None;
+		const auto slot = ResolveBindlessKey(request.heap, request, &words, &refusal);
+		translation.Translate(entry, slot);
+		WatchBindlessKey(request.heap, request.record, request.layer, words, refusal);
 	}
 	table.FlushTranslation();
 }
