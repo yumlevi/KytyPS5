@@ -80,6 +80,9 @@ Common::LiveControl::Switch g_hot_window("hot_window", 1);
 // until the download that rode the write's submission is published (the game is taken to read
 // it only after a signal of that submission, which the completion thread delivers after the
 // publication). 0: the page faults from the write on, as a page outside the hot set does.
+// From this size on a buffer's creation and its release are logged with their times.
+constexpr uint64_t LargeBufferBytes = 64ull << 20u;
+
 Common::LiveControl::Switch  g_stale_readable("stale_readable", 1);
 // 1: a hot page that stays readable through a GPU write gets that state in the protection update
 // that marks the write (RegionManager::MarkGpuWritten); 0: it is made unreadable by the mark and
@@ -539,7 +542,17 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	}
 	Unregister(id);
 	if (m_scheduler.Active()) {
-		m_scheduler.DeferOperation([this, id] { m_slot_buffers.erase(id); });
+		m_scheduler.DeferOperation([this, id] {
+			// (A large buffer's memory: how long giving it back takes, for the log.)
+			const auto size  = m_slot_buffers[id].Size();
+			const auto begin = std::chrono::steady_clock::now();
+			m_slot_buffers.erase(id);
+			const auto ms =
+			    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+			if (size >= LargeBufferBytes || ms >= 5.0) {
+				LOGF("BufferCache: a buffer of %" PRIu64 " MiB freed in %.1f ms\n", size >> 20u, ms);
+			}
+		});
 	} else {
 		m_slot_buffers.erase(id);
 	}
@@ -1894,10 +1907,36 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size, bool by_addres
 	size               = end - vaddr;
 	const auto overlap = ResolveOverlaps(vaddr, size);
 
+	// (A large buffer made anew, with the buffers it replaces copied into it: how long its
+	// memory, the copies and its registration take, for the log.)
+	using Clock      = std::chrono::steady_clock;
+	const auto began = Clock::now();
 	const auto id =
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, overlap.begin,
 	                          AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress,
 	                          overlap.end - overlap.begin, true);
+	const auto made   = Clock::now();
+	size_t     joined = 0;
+	uint64_t   copied = 0;
+	struct Report {
+		const BufferCache::OverlapResult& overlap;
+		Clock::time_point                 began, made;
+		const size_t&                     joined;
+		const uint64_t&                   copied;
+		Clock::time_point*                joins_done;
+		~Report() {
+			const auto ms = [](Clock::duration d) { return std::chrono::duration<double, std::milli>(d).count(); };
+			const auto end = Clock::now();
+			if (overlap.end - overlap.begin >= LargeBufferBytes || ms(end - began) >= 5.0) {
+				LOGF("BufferCache: a buffer of %" PRIu64 " MiB made at 0x%" PRIx64 " in %.1f ms: its memory %.1f, "
+				     "%zu buffers of %" PRIu64 " MiB copied into it %.1f, the rest %.1f\n",
+				     (overlap.end - overlap.begin) >> 20u, overlap.begin, ms(end - began), ms(made - began), joined,
+				     copied >> 20u, ms(*joins_done - made), ms(end - *joins_done));
+			}
+		}
+	};
+	Clock::time_point joins_done = made;
+	const Report      report {overlap, began, made, joined, copied, &joins_done};
 	auto& buffer = m_slot_buffers[id];
 	SetVulkanObjectNameF(m_graphics.device, buffer.Handle(),
 	                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", overlap.begin,
@@ -1907,8 +1946,11 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size, bool by_addres
 	for (auto it = overlap.first; it != overlap.last;) {
 		const auto old_id = (it++)->second;
 		read              = read || m_slot_buffers[old_id].bda_use != BdaUse::Unread;
+		joined++;
+		copied += m_slot_buffers[old_id].Size();
 		JoinOverlap(id, old_id, !overlap.has_stream_leap);
 	}
+	joins_done = Clock::now();
 	buffer.bda_use      = read ? BdaUse::Read : BdaUse::Unread;
 	buffer.bda_use_tick = m_gc_tick;
 	if (overlap.first != overlap.last) {
