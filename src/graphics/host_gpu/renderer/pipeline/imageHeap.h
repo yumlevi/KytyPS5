@@ -61,6 +61,8 @@ private:
 		size_t operator()(const DescriptorValue& value) const noexcept;
 	};
 
+	static constexpr uint32_t NoSlot = UINT32_MAX;
+
 	struct Element {
 		DescriptorValue value;
 		TextureBinding  binding;
@@ -68,6 +70,10 @@ private:
 		uint32_t        refs   = 0; // Slots of the owning view that select it.
 		bool            stale  = false;
 		uint64_t        serial = 0; // Image::serial of binding.image_id.
+		// The first of those slots: they form a list through View::slot_next and slot_prev
+		// (Assign keeps it), so an element that changed takes its slots without a look at
+		// every probe of the table.
+		uint32_t first_slot = NoSlot;
 	};
 
 	struct Memory;
@@ -80,6 +86,9 @@ private:
 		uint64_t                            limit = 0; // Probes a key domain allows, if fewer.
 		ShaderRecompiler::IR::ImageResource profile;
 		std::vector<uint32_t>               slots; // Plus a trailing null slot.
+		// Per slot, the next and the previous slot that select the same element (NoSlot: none).
+		std::vector<uint32_t>               slot_next;
+		std::vector<uint32_t>               slot_prev;
 		std::vector<uint32_t>               kind_keys;
 		std::vector<DescriptorValue>        kinds; // One representative per kind_keys entry.
 		std::unordered_map<DescriptorValue, uint32_t, DescriptorHash> elements;
@@ -141,6 +150,8 @@ private:
 	void     Unwatch(const Memory& memory);
 	void     Drop(Memory& memory);
 	void     UpdateProbes(View& view, uint64_t begin, uint64_t end);
+	// Rebind's scratch: the elements of the view at hand that it found changed.
+	std::vector<uint32_t> m_changed;
 	void     UpdateProbe(View& view, uint64_t probe);
 	void     Assign(View& view, size_t slot, uint32_t entry);
 	void     Bury();

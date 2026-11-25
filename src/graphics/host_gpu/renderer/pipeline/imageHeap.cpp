@@ -3,6 +3,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/liveControl.h"
+#include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
@@ -14,6 +15,8 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
+#include <cinttypes>
 #include <cstdio>
 #include <unordered_set>
 #include <utility>
@@ -68,11 +71,27 @@ Common::LiveControl::Counter g_heap_stale_dcc("heap_stale_dcc");
 Common::LiveControl::Counter g_heap_stale_held("heap_stale_held");
 Common::LiveControl::Counter g_heap_stale_scans("heap_stale_scans");
 Common::LiveControl::Counter g_heap_stale_probes("heap_stale_probes");
+Common::LiveControl::Counter g_heap_stale_scan_us("heap_stale_scan_us");
+// 1: the slots of a changed element are found through the element's list (Element::first_slot);
+// 0: by a look at every probe of its table, as before. heap_verify 1 (for a test, not during
+// a measurement): after the lists were used, every probe is looked at as well, and one that
+// still selects a changed element ends the emulator.
+//
+// Saros's main table has 198,000 probes and 1,750 images. One block of memory is its depth
+// buffer and, bound as a storage image by a compute pass, a colour image: the texture cache
+// makes the image anew at each change of use, twice a frame (ResolveDepthOverlap, 40 us), and
+// the table's two elements for it are found changed every frame: 0.4 ms a frame for the look
+// at every probe, to give two slots a new element.
+Common::LiveControl::Switch g_heap_slot_lists("heap_slot_lists", 1);
+Common::LiveControl::Switch g_heap_verify("heap_verify", 0);
 Common::LiveControl::Counter g_heap_dcc_resolves("heap_dcc_resolves");
 Common::LiveControl::Counter g_heap_held_resolves("heap_held_resolves");
 Common::LiveControl::Counter g_heap_pending_resolves("heap_pending_resolves");
 Common::LiveControl::Counter g_heap_layout_walks("heap_layout_walks");
 Common::LiveControl::Counter g_heap_layout_elements("heap_layout_elements");
+// 1: a line for each element the walk finds changed: why, and the image its descriptor named
+// (the memory and the size it was bound with).
+Common::LiveControl::Switch g_heap_log("heap_log", 0);
 
 bool Eligible(const IR::ImageHeapRequest& request) {
 	return request.count != 0u && request.step != 0u &&
@@ -246,6 +265,8 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 		                                                  .layout_epoch  = epoch,
 		                                                  .by_content    = by_content});
 		created->slots.resize(bytes / 4u + 1u);
+		created->slot_next.assign(created->slots.size(), NoSlot);
+		created->slot_prev.assign(created->slots.size(), NoSlot);
 		created->buffer = SlotBuffer(m_context, bytes);
 		UpdateProbes(*created, 0u, bytes);
 		// The first upload also clears the slots no probe selects.
@@ -471,6 +492,30 @@ void ImageHeap::UpdateProbe(View& view, uint64_t probe) {
 
 void ImageHeap::Assign(View& view, size_t slot, uint32_t entry) {
 	const auto previous = std::exchange(view.slots[slot], entry);
+	if (previous != entry) {
+		// The slot leaves the list of the element it selected and joins that of the new one,
+		// at its head. (Before the release: an element nothing selects any more is given up.)
+		const auto at = static_cast<uint32_t>(slot);
+		if (const auto old_index = previous & ElementMask; old_index != 0u) {
+			const auto next = view.slot_next[slot];
+			const auto prev = view.slot_prev[slot];
+			if (prev != NoSlot) {
+				view.slot_next[prev] = next;
+			} else {
+				m_elements[old_index].first_slot = next;
+			}
+			if (next != NoSlot) view.slot_prev[next] = prev;
+		}
+		if (const auto new_index = entry & ElementMask; new_index != 0u) {
+			auto& element        = m_elements[new_index];
+			view.slot_next[slot] = element.first_slot;
+			view.slot_prev[slot] = NoSlot;
+			if (element.first_slot != NoSlot) view.slot_prev[element.first_slot] = at;
+			element.first_slot = at;
+		} else {
+			view.slot_next[slot] = view.slot_prev[slot] = NoSlot;
+		}
+	}
 	Release(view, previous);
 	if (previous != entry) Widen(view.dirty_begin, view.dirty_end, slot, slot + 1u);
 }
@@ -621,6 +666,9 @@ void ImageHeap::Resize(Memory& memory, uint64_t size) {
 		view->count       = count;
 		const auto slots  = view->slots.size();
 		view->slots.resize(size / 4u + 1u);
+		// (The slots that go select nothing: the probes past the new count were cleared above.)
+		view->slot_next.resize(view->slots.size(), NoSlot);
+		view->slot_prev.resize(view->slots.size(), NoSlot);
 		view->dirty_end   = std::min(view->dirty_end, view->slots.size());
 		view->dirty_begin = std::min(view->dirty_begin, view->dirty_end);
 		if (view->slots.size() * sizeof(uint32_t) > view->buffer->Size()) {
@@ -644,7 +692,11 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 	g_heap_rebinds.Add();
 	for (auto* view: m_active) {
 		bool       stale = false;
-		const auto mark  = [&](uint32_t index) { m_elements[index].stale = stale = true; };
+		m_changed.clear();
+		const auto mark  = [&](uint32_t index) {
+			m_elements[index].stale = stale = true;
+			m_changed.push_back(index);
+		};
 		if (view->resolve_epoch != epoch) {
 			view->resolve_epoch = epoch;
 			g_heap_epoch_walks.Add();
@@ -656,6 +708,15 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 				if (image == nullptr || !image->registered || image->depth_id ||
 				    image->binding.needs_rebind) {
 					g_heap_stale_epoch.Add();
+					if (g_heap_log.On()) {
+						LOGF("Heap stale: element %u %s, image 0x%" PRIx64 "+0x%" PRIx64 " %ux%u\n", index,
+						     image == nullptr        ? "has no image any more"
+						     : !image->registered    ? "names an image that is not registered"
+						     : image->depth_id       ? "names an image with a depth image"
+						                             : "names an image that needs a rebind",
+						     binding.desc.info.data.address, binding.desc.info.data.size,
+						     binding.desc.info.extent.width, binding.desc.info.extent.height);
+					}
 					mark(index);
 				} else {
 					(void)textures.FindTexture(binding.image_id, binding.desc);
@@ -692,6 +753,8 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 				return binding.image_id || binding.desc.info.data.Empty();
 			});
 		}
+		const auto scan_begin = stale ? std::chrono::steady_clock::now()
+		                              : std::chrono::steady_clock::time_point {};
 		if (stale) {
 			g_heap_stale_scans.Add();
 			g_heap_stale_probes.Add(view->count);
@@ -699,13 +762,39 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 			// element keeps the old value, since a view takes table changes only when acquired.
 			std::erase_if(view->elements,
 			              [&](const auto& item) { return m_elements[item.second].stale; });
-			for (uint64_t probe = 0; probe < view->count; ++probe) {
-				const auto  slot    = (view->first + probe * view->step) / 4u;
-				const auto& element = m_elements[view->slots[slot] & ElementMask];
-				if (!element.stale) continue;
-				const auto value = element.value; // Intern may grow m_elements.
-				Assign(*view, slot, Intern(*view, element.kind, value));
+			const bool by_lists = g_heap_slot_lists.On();
+			if (by_lists) {
+				// Each slot of a changed element, from the element's own list: the first gets
+				// the new element made, the others select it too. (Assign takes the slot off
+				// the list being walked.)
+				for (const auto index: m_changed) {
+					const auto kind  = m_elements[index].kind;
+					const auto value = m_elements[index].value; // Intern may grow m_elements.
+					while (m_elements[index].first_slot != NoSlot) {
+						const auto slot = m_elements[index].first_slot;
+						if ((view->slots[slot] & ElementMask) != index) {
+							EXIT("image heap: a slot is on the list of an element it does not select\n");
+						}
+						Assign(*view, slot, Intern(*view, kind, value));
+					}
+				}
 			}
+			if (!by_lists || g_heap_verify.On()) {
+				for (uint64_t probe = 0; probe < view->count; ++probe) {
+					const auto  slot    = (view->first + probe * view->step) / 4u;
+					const auto& element = m_elements[view->slots[slot] & ElementMask];
+					if (!element.stale) continue;
+					if (by_lists) {
+						EXIT("image heap: a changed element's slot was not on its list\n");
+					}
+					const auto value = element.value; // Intern may grow m_elements.
+					Assign(*view, slot, Intern(*view, element.kind, value));
+				}
+			}
+			g_heap_stale_scan_us.Add(static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+			                                                          scan_begin)
+			        .count()));
 		}
 		for (const auto index: view->pending) {
 			if (m_elements[index].refs == 0u) continue;
