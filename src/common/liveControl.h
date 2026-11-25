@@ -34,6 +34,12 @@
 //                                  session's clock starts with the level's first frame (the camera
 //                                  coming on after the loading screen) instead of with the
 //                                  command: <from> is that frame's time in the log.
+//   shot <file>                    the game's picture at the next present, written to <file>
+//                                  (no blanks in the name) as a 32-bit BMP: read back from the
+//                                  GPU, so whatever the window's state is (minimized, or behind
+//                                  a lock screen or a screen saver, where a capture of the
+//                                  window is black). The log's "Screenshot:" line tells when
+//                                  the file is written.
 //   sleep <ms>                     wait before the next command
 //   wait [seconds]                 wait (at most that long, default 300) until the emulator has no
 //                                  shader translation or pipeline build left that it runs ahead of
@@ -115,6 +121,8 @@ struct HostHooks {
 	// A RenderDoc capture of the next two guest flips, as the F1 key asks for one (`capture`;
 	// the session was started with --rd).
 	void (*capture)() = nullptr;
+	// The game's picture at the next present, written to a file (`shot`).
+	void (*shot)(const char* path) = nullptr;
 };
 void SetHostHooks(const HostHooks& hooks) noexcept;
 

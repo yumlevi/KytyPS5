@@ -10,6 +10,7 @@
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/queueSubmitter.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -20,13 +21,19 @@
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
+#include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
+#include <cstring>
+#include <fstream>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <string>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -301,6 +308,81 @@ private:
 	uint32_t                       m_frame_index         = 0;
 };
 
+// `shot <file>` of the live channel (WindowRequestScreenshot): the file the next present of a
+// game frame writes that frame to.
+namespace {
+std::mutex        g_shot_mutex;
+std::string       g_shot_path;
+std::atomic<bool> g_shot_wanted {false};
+
+[[nodiscard]] uint32_t ShotBytesPerTexel(vk::Format format) {
+	return format == vk::Format::eR16G16B16A16Sfloat ? 8u : 4u;
+}
+
+// A texel of the frame as blue, green, red and alpha bytes. A float frame (HDR) is cut off at
+// 1.0: enough to see what is in the picture.
+void ShotTexel(vk::Format format, const uint8_t* source, uint8_t* bgra) {
+	const auto word = [&] {
+		uint32_t value = 0;
+		std::memcpy(&value, source, sizeof(value));
+		return value;
+	};
+	const auto ten = [](uint32_t value) { return static_cast<uint8_t>((value & 0x3ffu) >> 2u); };
+	switch (format) {
+		case vk::Format::eR8G8B8A8Unorm:
+		case vk::Format::eR8G8B8A8Srgb:
+			bgra[0] = source[2];
+			bgra[1] = source[1];
+			bgra[2] = source[0];
+			bgra[3] = source[3];
+			break;
+		case vk::Format::eA2R10G10B10UnormPack32:
+			bgra[0] = ten(word());
+			bgra[1] = ten(word() >> 10u);
+			bgra[2] = ten(word() >> 20u);
+			bgra[3] = 0xff;
+			break;
+		case vk::Format::eA2B10G10R10UnormPack32:
+			bgra[0] = ten(word() >> 20u);
+			bgra[1] = ten(word() >> 10u);
+			bgra[2] = ten(word());
+			bgra[3] = 0xff;
+			break;
+		case vk::Format::eR16G16B16A16Sfloat: {
+			const auto half = [&](uint32_t channel) {
+				uint16_t bits = 0;
+				std::memcpy(&bits, source + channel * 2u, sizeof(bits));
+				const auto exponent = (bits >> 10u) & 0x1fu;
+				const auto mantissa = bits & 0x3ffu;
+				float      value    = exponent == 0u ? std::ldexp(static_cast<float>(mantissa), -24)
+				                      : exponent == 31u
+				                          ? 1.0f
+				                          : std::ldexp(static_cast<float>(mantissa | 0x400u),
+				                                       static_cast<int>(exponent) - 25);
+				if ((bits & 0x8000u) != 0u) {
+					value = 0.0f;
+				}
+				return static_cast<uint8_t>(std::clamp(value, 0.0f, 1.0f) * 255.0f + 0.5f);
+			};
+			bgra[0] = half(2);
+			bgra[1] = half(1);
+			bgra[2] = half(0);
+			bgra[3] = 0xff;
+			break;
+		}
+		default: // B8G8R8A8, and whatever else has four bytes a texel.
+			std::memcpy(bgra, source, 4);
+			break;
+	}
+}
+} // namespace
+
+void WindowRequestScreenshot(const char* path) {
+	const std::scoped_lock lock {g_shot_mutex};
+	g_shot_path = path;
+	g_shot_wanted.store(!g_shot_path.empty(), std::memory_order_release);
+}
+
 struct Presenter::Impl {
 	explicit Impl(WindowContext& owner)
 	    : renderer(*owner.render_context), window(owner), swapchain(owner),
@@ -338,6 +420,71 @@ struct Presenter::Impl {
 		return image;
 	}
 	void Present();
+
+	// A copy of the frame into a buffer the host reads, in the present's commands.
+	[[nodiscard]] std::unique_ptr<Buffer> RecordScreenshot(CommandBuffer& command, Frame& frame) {
+		const auto size = uint64_t {frame.image.extent.width} * frame.image.extent.height *
+		                  ShotBytesPerTexel(frame.image.format);
+		auto buffer = std::make_unique<Buffer>(window.graphic_ctx, present_scheduler,
+		                                       MemoryUsage::Download, 0,
+		                                       vk::BufferUsageFlagBits::eTransferDst, size);
+		auto vk_command = command.PipelineHandle();
+		frame.Transit(vk_command, vk::ImageLayout::eTransferSrcOptimal,
+		              vk::AccessFlagBits2::eTransferRead);
+		vk::BufferImageCopy region {};
+		region.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		region.imageExtent      = {frame.image.extent.width, frame.image.extent.height, 1};
+		vk_command.copyImageToBuffer(frame.image.image, vk::ImageLayout::eTransferSrcOptimal,
+		                             buffer->Handle(), 1, &region);
+		return buffer;
+	}
+
+	// The copy, once the GPU has made it (`tick`), as a top-down 32-bit BMP.
+	void WriteScreenshot(Buffer& buffer, const Frame& frame, uint64_t tick) {
+		present_scheduler.Wait(tick);
+		std::string path;
+		{
+			const std::scoped_lock lock {g_shot_mutex};
+			path = std::move(g_shot_path);
+			g_shot_path.clear();
+			g_shot_wanted.store(false, std::memory_order_release);
+		}
+		const auto width  = frame.image.extent.width;
+		const auto height = frame.image.extent.height;
+		const auto format = frame.image.format;
+		const auto texel  = ShotBytesPerTexel(format);
+		if (buffer.Mapped().size() < uint64_t {width} * height * texel) {
+			LOGF("Screenshot: %s not written: the copy is not readable\n", path.c_str());
+			return;
+		}
+		buffer.Invalidate(0, buffer.Size());
+		constexpr uint32_t   Header = 54;
+		std::vector<uint8_t> file(Header + size_t {width} * height * 4u, 0);
+		const auto put = [&](size_t at, uint32_t value, uint32_t bytes) {
+			std::memcpy(file.data() + at, &value, bytes);
+		};
+		file[0] = 'B';
+		file[1] = 'M';
+		put(2, static_cast<uint32_t>(file.size()), 4);
+		put(10, Header, 4);
+		put(14, 40, 4);
+		put(18, width, 4);
+		put(22, 0u - height, 4);
+		put(26, 1, 2);
+		put(28, 32, 2);
+		put(34, static_cast<uint32_t>(file.size() - Header), 4);
+		const auto* source = buffer.Mapped().data();
+		for (size_t i = 0; i < size_t {width} * height; ++i) {
+			ShotTexel(format, source + i * texel, file.data() + Header + i * 4u);
+		}
+		std::ofstream out(path, std::ios::binary | std::ios::trunc);
+		out.write(reinterpret_cast<const char*>(file.data()),
+		          static_cast<std::streamsize>(file.size()));
+		out.close();
+		LOGF("Screenshot: %s %s, %ux%u of format %d%s\n", path.c_str(),
+		     out.fail() ? "could not be written" : "written", width, height,
+		     static_cast<int>(format), frame.hdr ? " (HDR)" : "");
+	}
 
 	RenderContext&        renderer;
 	WindowContext&        window;
@@ -1116,6 +1263,12 @@ void Presenter::Impl::Present() {
 		}();
 		swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
 		                                draw_system_overlay);
+		// (`shot`: the frame of the main bus, with the present's own commands.)
+		std::unique_ptr<Buffer> shot;
+		if (g_shot_wanted.load(std::memory_order_acquire) && layers[0].frame != nullptr &&
+		    !layers[0].frame->blank) {
+			shot = RecordScreenshot(command, *layers[0].frame);
+		}
 		const auto tick = swapchain.Submit(present_scheduler);
 		for (const auto& layer: layers) {
 			if (layer.frame != nullptr) {
@@ -1136,6 +1289,9 @@ void Presenter::Impl::Present() {
 		}
 		if (main_layer != nullptr) {
 			main_layer->fg_shown = true;
+		}
+		if (shot != nullptr) {
+			WriteScreenshot(*shot, *main_layer, tick);
 		}
 		if (status != Swapchain::Status::Success) {
 			RecoverSwapchain(status);

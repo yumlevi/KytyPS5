@@ -1894,6 +1894,9 @@ void Execute(uint64_t id, const std::string& line) {
 	} else if (command == "capture" && g_hooks.capture != nullptr) {
 		g_hooks.capture();
 		Answer(Format("LIVE capture id=%" PRIu64, id));
+	} else if (command == "shot" && words.size() == 2 && g_hooks.shot != nullptr) {
+		g_hooks.shot(words[1].c_str());
+		Answer(Format("LIVE shot id=%" PRIu64 " %s", id, words[1].c_str()));
 	} else if (command == "quit" && g_hooks.quit != nullptr) {
 		Answer(Format("LIVE quit id=%" PRIu64, id));
 		g_hooks.quit();

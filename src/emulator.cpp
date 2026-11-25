@@ -13,6 +13,7 @@
 #include "common/subsystems.h"
 #include "common/systemInfo.h"
 #include "common/threads.h"
+#include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window.h"
 #include "graphics/shader/gameShaderSeeds.h"
@@ -192,6 +193,7 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 	    },
 	    .input_seconds = [] { return Libs::Graphics::WindowInputSeconds(); },
 	    .capture       = [] { Libs::Graphics::RenderDocRequestCapture(); },
+	    .shot          = [](const char* path) { Libs::Graphics::WindowRequestScreenshot(path); },
 	});
 	// --unreal-cvar: the title's own settings, once it runs.
 	Libs::LibKernel::UnrealCvars::Start(Config::UnrealCvars());
