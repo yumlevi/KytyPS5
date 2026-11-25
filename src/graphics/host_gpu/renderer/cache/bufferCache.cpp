@@ -195,24 +195,52 @@ Common::LiveControl::Counter g_fault_ahead_windows("fault_ahead_windows");
 // take a few requests.
 //
 // The pages ahead are a guess, and other threads store into the same pools at the same time
-// (a dozen of them while a level streams in), so they are read back only by the requester's own
-// copy (GuestCopy), which takes each page under its region's lock and only while the page is
-// still GPU-dirty there: whoever stored into a page meanwhile has cleaned it first. The GPU
-// thread's download is not such a copy. It records the window's dirty bytes and writes them
-// into the guest's memory after its wait for the GPU, whatever happened to the pages in
-// between; for a page another thread had just been handed and had stored into, that put the
-// GPU's old bytes over the new data (streamed textures and meshes: a level that looks wrong
-// after a death, when the pools are given out again). A window that cannot be handed to the
-// requester is therefore cut back to the request's own pages, and the limit is what one copy
-// takes (guest_copy_max_kb less the request's page).
-//
-// As first written, with windows up to 256 pages that the GPU thread downloaded past a quarter
-// megabyte: a cycle restarted from the pause menu and the walk after it, one run each way,
-// 52 -> 40 slow frames, 3.3 -> 2.7 s over the usual frame time, the game's threads held
-// 3.4 -> 1.8 s by such readbacks.
+// (a dozen of them while a level streams in). Whoever brings their bytes therefore writes a
+// page only under its region's lock and only while the page is still GPU-dirty there: a thread
+// that was handed the page before and has stored into it has cleaned it first, and keeps its
+// bytes. (Written whatever had happened to the page, as the GPU thread's download once did
+// after its wait for the GPU, the GPU's old bytes went over the new data: streamed textures
+// and meshes, a level that looks wrong after a death, when the pools are given out again.)
+// Two bring them that way: the requester's own copy out of the buffer's mapping (GuestCopy),
+// for which the GPU thread records nothing and waits for nothing, and that thread's download
+// (store_ahead_gpu below). This limit is what one copy takes (guest_copy_max_kb less the
+// request's page); a window that is served by neither is cut back to the request's own pages.
 Common::LiveControl::Switch  g_store_ahead("store_ahead", 63);
 Common::LiveControl::Counter g_store_ahead_pages("store_ahead_pages");
 Common::LiveControl::Counter g_store_ahead_windows("store_ahead_windows");
+
+// The most pages ahead of a store that the GPU thread's download brings (a window of the
+// buffer copied on the GPU into host memory and published from there:
+// DownloadBufferMemory); 0: no such windows, a run stays at store_ahead pages a request.
+//
+// The mapping a copy reads gives the whole process about 85 MB a second (10 to 12 us a KiB,
+// streaming loads included, and no more with several threads reading), so a block of 4 MiB
+// given to new data is 45 ms of it, during which the game's threads stand in their stores and
+// the GPU thread has nothing to draw. A run that goes on past the windows of store_ahead
+// therefore keeps doubling, up to this, and such a window is one copy on the GPU and one wait
+// for it.
+//
+// Only while the GPU has caught up (its last submission is finished and nothing is recorded
+// for the next): then the copy runs at once, and the wait holds up no frame's work. With work
+// queued, the wait would be for all of it, where the requester's copy waits for the buffer's
+// last write alone: the window is then cut back to what a copy takes. It ends with the run of
+// GPU-written pages the store walks into (what is read back and then not overwritten is
+// uploaded again), and one pass of requests takes MaxPassWindowBytes of them at most (its
+// publications lie in the download ring until the pass has waited).
+Common::LiveControl::Switch  g_store_ahead_gpu("store_ahead_gpu", 1023);
+Common::LiveControl::Counter g_store_gpu_windows("store_gpu_windows");
+// What such windows brought, and the passes that held one, from their first request to the
+// last hand-over (the copy, the wait for the GPU, the publication, the pages' protection).
+Common::LiveControl::Counter g_store_gpu_kb("store_gpu_kb");
+Common::LiveControl::Counter g_store_gpu_us("store_gpu_us");
+constexpr uint64_t           MaxPassWindowBytes = 16ull << 20u;
+
+// A guest thread's run of stores through GPU-written pages (BufferCache::StoreAhead).
+struct StoreRun {
+	uint64_t next_page = 0; // Where its next such fault continues the run.
+	uint32_t window    = 0; // The pages ahead it asked for last.
+};
+thread_local StoreRun t_store_run;
 
 std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
                                         StreamBuffer& staging, uint64_t size, uint64_t alignment,
@@ -560,7 +588,8 @@ void BufferCache::DeleteBuffer(BufferId id) {
 
 template <bool async>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,
-                                       std::vector<Common::UniqueFunction<void>>* batch) {
+                                       std::vector<Common::UniqueFunction<void>>*  batch,
+                                       std::vector<std::pair<uint64_t, uint64_t>>* written) {
 	const CommandBuffer::ProfileGuard profile(m_scheduler.Current(),
 	                                          CommandBuffer::ProfileScope::Downloads);
 	struct Run {
@@ -574,8 +603,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	const auto       buffer_address = buffer.CpuAddress();
 	m_memory_tracker.ForEachDownloadRange<false>(
 	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
-		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges.Ranges(), address, bytes,
-		                                           "buffer download");
+		    ValidateDirtyRun(address, bytes, "buffer download");
 		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
 			    copies.emplace_back(start - buffer_address, total_size, end - start);
 			    // Start each packed range on its own 64-byte cache line.
@@ -588,6 +616,14 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	if (copies.empty()) {
 		return false;
 	}
+#if KYTY_BUILD == KYTY_BUILD_DEBUG
+	if (batch != nullptr) {
+		// (Until the pass publishes: see ValidateDirtyRun.)
+		for (const auto& run: runs) {
+			m_pass_taken.emplace_back(run.address, run.bytes);
+		}
+	}
+#endif
 	// The bytes of these pages come with this download now (their ranges left the set the hot
 	// pages' own download reads), and its publication runs where it was queued or, for the GPU
 	// thread's own, after that thread's wait: behind the labels of the submission. A page among
@@ -638,12 +674,13 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		written_begin = std::min(written_begin, buffer_address + copy.srcOffset);
 		written_end   = std::max(written_end, buffer_address + copy.srcOffset + copy.size);
 	}
-	auto publish = [this, total_size, buffer_address, copies = std::move(copies),
+	auto publish = [this, total_size, buffer_address, written, copies = std::move(copies),
 	                runs = std::move(runs), download = std::move(download)] {
 		download.buffer->Invalidate(download.offset, total_size);
 		if constexpr (async) {
 			(void)this;
 			(void)runs;
+			(void)written;
 			for (const auto& copy: copies) {
 				Libs::LibKernel::Memory::WriteBacking(
 				    buffer_address + copy.srcOffset,
@@ -684,6 +721,9 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 								            (from - begin_of(i)),
 								        to - from);
 							    }
+						    }
+						    if (written != nullptr) {
+							    written->emplace_back(address, bytes);
 						    }
 					    });
 				}
@@ -732,8 +772,7 @@ bool BufferCache::ReadBackInPlace(Buffer& buffer, uint64_t vaddr, uint64_t size)
 	const auto copy_begin     = std::chrono::steady_clock::now();
 	m_memory_tracker.ForEachDownloadRange<false>(
 	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
-		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges.Ranges(), address, bytes,
-		                                           "in-place readback");
+		    ValidateDirtyRun(address, bytes, "in-place readback");
 		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
 			    m_in_place_scratch.resize(static_cast<size_t>(end - start));
 			    buffer.ReadMapped(start - buffer_address, end - start, m_in_place_scratch.data());
@@ -899,26 +938,26 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size, bool guest_sto
 }
 
 uint64_t BufferCache::StoreAhead(uint64_t vaddr) {
-	const auto limit = g_store_ahead.Get();
+	const auto limit = std::max(g_store_ahead.Get(), g_store_ahead_gpu.Get());
 	if (limit == 0) {
 		return 0;
 	}
-	// The run of one thread, as in FaultAhead: a fault on the page after the last one, or after
-	// the window the last one was given, doubles the window. A single store asks for its own
-	// page only, as before.
-	thread_local uint64_t next_page = 0;
-	thread_local uint32_t window    = 0;
-	const auto            page      = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
-	if (page != next_page) {
-		next_page = page + TRACKER_PAGE_SIZE;
-		window    = 0;
+	// The run of one thread, as in FaultAhead: a fault on the page after the last one, or where
+	// the window the last one was given ended, doubles the window. A single store asks for its
+	// own page only, as before. (The end of the window it is given comes with the request's
+	// answer, RequestGuestReadback: it may be less than was asked for.)
+	auto&      run  = t_store_run;
+	const auto page = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	if (page != run.next_page) {
+		run.next_page = page + TRACKER_PAGE_SIZE;
+		run.window    = 0;
 		return 0;
 	}
-	window    = std::min<uint32_t>(window == 0 ? 2u : window * 2u, limit);
-	next_page = page + (uint64_t {window} + 1u) * TRACKER_PAGE_SIZE;
+	run.window    = std::min<uint32_t>(run.window == 0 ? 2u : run.window * 2u, limit);
+	run.next_page = page + (uint64_t {run.window} + 1u) * TRACKER_PAGE_SIZE;
 	g_store_ahead_windows.Add();
-	g_store_ahead_pages.Add(window);
-	return uint64_t {window} * TRACKER_PAGE_SIZE;
+	g_store_ahead_pages.Add(run.window);
+	return uint64_t {run.window} * TRACKER_PAGE_SIZE;
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, uint64_t ahead) {
@@ -959,7 +998,15 @@ void BufferCache::RequestGuestReadback(const GuestReadback& request) {
 	        : request.kind == GuestReadback::Kind::Around ? "readback-for-read" : "readback",
 	    request.vaddr, request.size);
 	std::shared_ptr<GuestCopy> copy;
-	QueueGuestReadback(request, g_guest_copy.On() ? &copy : nullptr);
+	uint64_t                   served_end = 0;
+	QueueGuestReadback(request, g_guest_copy.On() ? &copy : nullptr,
+	                   request.ahead != 0 ? &served_end : nullptr);
+	if (served_end != 0) {
+		// A store's run goes on where the window it was given ends: that may be before the end
+		// of the one it asked for (cut back to what a copy takes, to the run of GPU-written
+		// pages, or to its own pages), and a fault there is no new run.
+		t_store_run.next_page = served_end;
+	}
 	if (copy == nullptr) {
 		return;
 	}
@@ -1013,7 +1060,7 @@ void BufferCache::RequestGuestReadback(const GuestReadback& request) {
 }
 
 void BufferCache::QueueGuestReadback(const GuestReadback&        request,
-                                     std::shared_ptr<GuestCopy>* handoff) {
+                                     std::shared_ptr<GuestCopy>* handoff, uint64_t* served_end) {
 	// Every request is followed by a command that serves all pending ones, so it is served by
 	// its own command at the latest; a later command finds nothing left.
 	std::binary_semaphore done {0};
@@ -1022,6 +1069,7 @@ void BufferCache::QueueGuestReadback(const GuestReadback&        request,
 		auto&           queued = m_guest_readbacks.emplace_back(request);
 		queued.done            = &done;
 		queued.handoff         = handoff;
+		queued.served_end      = served_end;
 	}
 	m_scheduler.Context().GetGpu().SendCommand([this] {
 		std::vector<GuestReadback> requests;
@@ -1043,10 +1091,27 @@ void BufferCache::ServeGuestReadbacks(std::span<const GuestReadback> requests) {
 		bool     copied = false;
 		bool     skip   = false;
 		bool     handed = false;
+		// A store whose pages ahead come with the download: what its publication wrote.
+		bool                                       window = false;
+		std::vector<std::pair<uint64_t, uint64_t>> written;
 	};
 	std::vector<Served>                          served(requests.size());
 	std::vector<Common::UniqueFunction<void>>    publications;
 	std::optional<Common::GpuTiming::SyncReason> submit_reason;
+	// What the requester's own copy takes of a store's pages ahead, and whether the download
+	// may take more in this pass (see store_ahead_gpu): asked before anything is recorded here.
+	const auto copy_most   = uint64_t {g_store_ahead.Get()} * TRACKER_PAGE_SIZE;
+	bool       gpu_free    = false;
+	uint64_t   window_room = MaxPassWindowBytes;
+	uint64_t   windows     = 0;
+	if (g_store_ahead_gpu.On() && std::ranges::any_of(requests, [](const GuestReadback& request) {
+		    return request.ahead != 0 && request.handoff != nullptr;
+	    })) {
+		gpu_free = m_scheduler.IsFree(m_scheduler.CurrentTick() - 1) &&
+		           !m_scheduler.Current().HasCommands();
+	}
+	const auto pass_begin = gpu_free ? std::chrono::steady_clock::now()
+	                                 : std::chrono::steady_clock::time_point {};
 	for (size_t i = 0; i < requests.size(); i++) {
 		const auto&                        request = requests[i];
 		auto&                              result  = served[i];
@@ -1106,11 +1171,19 @@ void BufferCache::ServeGuestReadbacks(std::span<const GuestReadback> requests) {
 			if (request.kind == GuestReadback::Kind::Write && request.ahead != 0 &&
 			    request.handoff != nullptr) {
 				// A store that runs on through GPU-written pages: those after its own, as far
-				// as the buffer goes (StoreAhead). For the requester's own copy only, see below.
+				// as the buffer goes (StoreAhead). For the requester's own copy or the
+				// download, see below.
 				const auto own_end = end;
 				end = std::max(end, std::min(Common::AlignUp(wanted_end, TRACKER_PAGE_SIZE) +
 				                                 request.ahead,
 				                             buffer.CpuAddress() + buffer.Size()));
+				if (end - own_end > copy_most) {
+					// More than a copy takes, which only the download brings: it ends with the
+					// run of GPU-written pages the store walks into. (What a copy takes stays,
+					// whatever lies in it: the copy reads the dirty bytes alone.)
+					end = std::max(std::min(end, GpuWrittenRunEnd(own_end, end)),
+					               own_end + copy_most);
+				}
 				ahead_bytes = end - own_end;
 			}
 			if (request.kind == GuestReadback::Kind::Around) {
@@ -1187,34 +1260,64 @@ void BufferCache::ServeGuestReadbacks(std::span<const GuestReadback> requests) {
 			     buffer.gpu_write_open ? " (open)" : "",
 			     submitted == 0 ? "none" : m_scheduler.IsFree(submitted) ? "done" : "running");
 		}
-		bool handed = request.handoff != nullptr &&
-		              HandOffGuestCopy(request, buffer, buffer_id, result.base, result.size);
-		if (!handed && ahead_bytes != 0) {
-			// The pages ahead of a store are a guess about memory other threads store into as
-			// well. The requester's copy takes each of them under its region's lock and only
-			// while it is GPU-dirty; nothing served here does that for bytes it would write
-			// after a wait for the GPU. Without that copy the request is its own pages, as it
-			// was before there were pages ahead.
-			result.size -= ahead_bytes;
-			handed = HandOffGuestCopy(request, buffer, buffer_id, result.base, result.size);
+		// The pages ahead of a store are a guess about memory other threads store into as
+		// well. They come with the requester's copy when it takes the window, or with the
+		// download: for a window larger than a copy takes, or one the copy cannot be handed
+		// (a buffer without a mapping), while the GPU has caught up and the buffer's last
+		// write is submitted, as the copy asks. Otherwise the window is what a copy takes
+		// and, without that copy, the request's own pages, as it was before there were
+		// pages ahead.
+		bool       handed      = false;
+		bool       window      = false;
+		const auto by_download = [&] {
+			return gpu_free && result.size <= window_room && !buffer.gpu_write_open &&
+			       buffer.gpu_write_tick < m_scheduler.CurrentTick();
+		};
+		if (ahead_bytes > copy_most) {
+			if (by_download()) {
+				window = true;
+			} else {
+				result.size -= ahead_bytes - copy_most;
+				ahead_bytes  = copy_most;
+			}
+		}
+		if (!window) {
+			handed = request.handoff != nullptr &&
+			         HandOffGuestCopy(request, buffer, buffer_id, result.base, result.size);
+			if (!handed && ahead_bytes != 0) {
+				if (by_download()) {
+					window = true;
+				} else {
+					result.size -= ahead_bytes;
+					handed = HandOffGuestCopy(request, buffer, buffer_id, result.base, result.size);
+				}
+			}
 		}
 		if (handed) {
 			// The requester does the rest, tracker state included, and starts now: the other
 			// requests of the batch may wait for the GPU.
 			result.skip   = true;
 			result.handed = true;
+			if (request.served_end != nullptr) {
+				*request.served_end = result.base + result.size;
+			}
 			request.done->release();
 			continue;
 		}
 		AwaitSubmittedDownloads(result.base, result.size);
-		if (ReadBackInPlace(buffer, result.base, result.size)) {
+		if (window) {
+			// (Not read in place: the pages the publication writes are handed over below.)
+			result.window = true;
+			window_room  -= result.size;
+			windows++;
+		} else if (ReadBackInPlace(buffer, result.base, result.size)) {
 			// Published already: only the tracker state below remains.
 			result.copied = true;
 			Common::GpuTiming::Sync().AddInPlaceReadback();
 			continue;
 		}
-		result.copied =
-		    DownloadBufferMemory<false>(buffer, result.base, result.size, &publications);
+		result.copied = DownloadBufferMemory<false>(buffer, result.base, result.size, &publications,
+		                                            window ? &result.written : nullptr);
 		if (result.copied) {
 			if (submit_reason) {
 				// Rides the submission of an earlier request of the batch.
@@ -1233,6 +1336,10 @@ void BufferCache::ServeGuestReadbacks(std::span<const GuestReadback> requests) {
 			publish();
 		}
 	}
+#if KYTY_BUILD == KYTY_BUILD_DEBUG
+	m_pass_taken.clear();
+#endif
+	uint64_t window_bytes = 0;
 	for (size_t i = 0; i < requests.size(); i++) {
 		const auto& result = served[i];
 		if (!result.skip) {
@@ -1240,17 +1347,124 @@ void BufferCache::ServeGuestReadbacks(std::span<const GuestReadback> requests) {
 				m_memory_tracker.UnmarkRegionAsGpuModified(result.base, result.size);
 			}
 			if (requests[i].kind == GuestReadback::Kind::Write) {
-				// (Pages ahead of a store are handed over by the requester's own copy alone, see
-				// RequestGuestReadback.)
 				m_memory_tracker.MarkRegionAsCpuModified(requests[i].vaddr, requests[i].size);
 				QueueBdaSync(requests[i].vaddr, requests[i].size);
+				if (result.window) {
+					// The pages ahead that came with the download, before the requester goes
+					// on. (Those of a requester's own copy are handed over by the requester,
+					// see RequestGuestReadback.)
+					window_bytes += HandOverStoreWindow(
+					    Common::AlignUp(requests[i].vaddr + requests[i].size, TRACKER_PAGE_SIZE),
+					    result.written);
+				}
+			}
+			if (requests[i].served_end != nullptr) {
+				*requests[i].served_end = result.base + result.size;
 			}
 		}
 		if (requests[i].done != nullptr && !result.handed) {
 			requests[i].done->release();
 		}
 	}
+	if (windows != 0) {
+		g_store_gpu_windows.Add(windows);
+		g_store_gpu_kb.Add(window_bytes >> 10u);
+		g_store_gpu_us.Add(static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+		                                                          pass_begin)
+		        .count()));
+	}
 }
+
+uint64_t BufferCache::GpuWrittenRunEnd(uint64_t begin, uint64_t limit) {
+	begin = Common::AlignUp(begin, TRACKER_PAGE_SIZE);
+	if (begin >= limit) {
+		return begin;
+	}
+	// The pages that are GPU-dirty in a row from `begin`...
+	uint64_t dirty_end = begin;
+	m_memory_tracker.ForEachDownloadRange<false>(begin, limit - begin,
+	                                             [&](uint64_t address, uint64_t bytes) noexcept {
+		                                             if (address == dirty_end) {
+			                                             dirty_end = address + bytes;
+		                                             }
+	                                             });
+	if (dirty_end == begin) {
+		return begin;
+	}
+	// ... and of those, the ones that hold bytes in a row: a dirty page without bytes is one an
+	// earlier download of the pass took, and belongs to that download's request.
+	uint64_t held_end = begin;
+	bool     gap      = false;
+	m_gpu_modified_ranges.ForEachInRange(begin, dirty_end - begin, [&](uint64_t from, uint64_t to) {
+		if (gap || Common::AlignDown(from, TRACKER_PAGE_SIZE) > held_end) {
+			gap = true;
+			return;
+		}
+		held_end = std::max(held_end, Common::AlignUp(to, TRACKER_PAGE_SIZE));
+	});
+	return std::min(dirty_end, held_end);
+}
+
+uint64_t BufferCache::HandOverStoreWindow(uint64_t                                         own_end,
+                                          std::span<const std::pair<uint64_t, uint64_t>> written) {
+	// What RequestGuestReadback does after the requester's own copy, for the pages this
+	// download's publication wrote and no other: a page it found clean was another thread's by
+	// then (handed to it before, and published or stored into since), and a clean page that
+	// was never GPU-written stays write-protected, another cache may watch it.
+	constexpr uint64_t NotePart  = 32 * CACHING_PAGESIZE;
+	uint64_t           handed    = 0;
+	uint64_t           run_begin = 0;
+	uint64_t           run_end   = 0;
+	const auto         hand_over = [&] {
+		if (run_end <= run_begin) {
+			return;
+		}
+		// (With an empty flush: a part of a region that held a GPU-dirty page would be left as
+		// it is. There is none, the pages were published just now and this thread alone marks
+		// GPU writes.)
+		m_memory_tracker.InvalidateRegion(run_begin, run_end - run_begin, [] {});
+		// A fault tells of the store into its page; told in one piece, a megabyte of pages
+		// passes for a wide store, which every shared stream copy gives way to.
+		for (auto part = run_begin; part < run_end; part += NotePart) {
+			NoteStreamCopyStore(part, std::min(NotePart, run_end - part));
+		}
+		// The stores are still to come: they are the guest's, due at the ordering point that
+		// follows them, as those of pages opened ahead of a fault (FaultAhead).
+		QueueBdaSync(run_begin, run_end - run_begin, true);
+		handed += run_end - run_begin;
+	};
+	for (const auto& [address, bytes]: written) {
+		const auto begin = std::max(address, own_end);
+		const auto end   = address + bytes;
+		if (begin >= end) {
+			continue;
+		}
+		if (begin > run_end) {
+			hand_over();
+			run_begin = begin;
+			run_end   = end;
+		} else {
+			run_end = std::max(run_end, end);
+		}
+	}
+	hand_over();
+	return handed;
+}
+
+#if KYTY_BUILD == KYTY_BUILD_DEBUG
+void BufferCache::ValidateDirtyRun(uint64_t address, uint64_t bytes, const char* operation) const {
+	for (auto page = address; page < address + bytes; page += TRACKER_PAGE_SIZE) {
+		const bool taken = std::ranges::any_of(m_pass_taken, [page](const auto& run) {
+			return page >= run.first && page - run.first < run.second;
+		});
+		if (!taken) {
+			m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges.Ranges(), page,
+			                                       TRACKER_PAGE_SIZE, operation);
+		}
+	}
+}
+#endif
 
 // The hot set: the pages the game reads back every frame (a town of Ghost of Yotei faults about
 // 500 distinct pages per frame). When full, the coldest eighth is evicted at once, so an insert

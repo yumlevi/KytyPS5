@@ -194,7 +194,7 @@ public:
 	void FaultAhead(uint64_t vaddr);
 	// After a guest thread's write fault on a page of GPU-written bytes at `vaddr`: the bytes
 	// after the page to read back with it, when the thread's last such fault was on the page
-	// before (or before the window that fault was given).
+	// before (or where the window that fault was given ended).
 	[[nodiscard]] static uint64_t StoreAhead(uint64_t vaddr);
 	// A guest submission begins a store epoch (see BdaSyncQueue). Safe from any thread.
 	[[nodiscard]] uint64_t BeginBdaStoreEpoch();
@@ -297,7 +297,9 @@ private:
 	template <bool async>
 	[[nodiscard]] bool
 	DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,
-	                     std::vector<Common::UniqueFunction<void>>* batch = nullptr);
+	                     std::vector<Common::UniqueFunction<void>>* batch = nullptr,
+	                     // (Not asynchronous:) the ranges the publication wrote, address and size.
+	                     std::vector<std::pair<uint64_t, uint64_t>>* written = nullptr);
 	void ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size);
 	// Reads the GPU-dirty bytes of [vaddr, size) of a host-readable buffer straight from its
 	// mapping into guest memory, after waiting only for the submission that holds the buffer's
@@ -347,15 +349,36 @@ private:
 		// Where the GPU thread may leave the rest of the request to the requester; null: it
 		// serves all of it.
 		std::shared_ptr<GuestCopy>* handoff = nullptr;
-		// A store: the bytes after its pages that the requester's own copy reads back with them
-		// while they lie in the same buffer (StoreAhead); the pages that copy brought the bytes
-		// of then belong to the CPU. Served without such a copy, the request is its own pages.
+		// A store: the bytes after its pages that are read back with them while they lie in the
+		// same buffer (StoreAhead), by the requester's own copy or, past what a copy takes, by
+		// the GPU thread's download (the store_ahead_gpu switch); the pages whose bytes came
+		// then belong to the CPU. Served without either, the request is its own pages.
 		uint64_t ahead = 0;
+		// Where the GPU thread leaves the end of the window it served (or handed over); null:
+		// nobody asks.
+		uint64_t* served_end = nullptr;
 	};
 	void RequestGuestReadback(const GuestReadback& request);
 	// A guest thread: queues the request and returns once the GPU thread served it.
-	void QueueGuestReadback(const GuestReadback& request, std::shared_ptr<GuestCopy>* handoff);
+	void QueueGuestReadback(const GuestReadback& request, std::shared_ptr<GuestCopy>* handoff,
+	                        uint64_t* served_end = nullptr);
 	void ServeGuestReadbacks(std::span<const GuestReadback> requests);
+	// GPU thread: the end of the run of tracker pages from `begin`, below `limit`, that are
+	// GPU-dirty and whose GPU-written bytes are still to be read back.
+	[[nodiscard]] uint64_t GpuWrittenRunEnd(uint64_t begin, uint64_t limit);
+	// GPU thread: the pages from `own_end` on that the download of a store's window published
+	// (`written`, ascending) belong to the CPU, as after a fault on each. Returns their bytes.
+	uint64_t HandOverStoreWindow(uint64_t                                         own_end,
+	                             std::span<const std::pair<uint64_t, uint64_t>> written);
+	// A GPU-dirty run of tracker pages holds GPU-written bytes (debug builds check it), unless a
+	// download of the running pass of ServeGuestReadbacks took them: its pages stay dirty until
+	// the pass publishes.
+#if KYTY_BUILD == KYTY_BUILD_DEBUG
+	void ValidateDirtyRun(uint64_t address, uint64_t bytes, const char* operation) const;
+	std::vector<std::pair<uint64_t, uint64_t>> m_pass_taken;
+#else
+	void ValidateDirtyRun(uint64_t, uint64_t, const char*) const noexcept {}
+#endif
 	// GPU thread: leaves the request's window [base, base + size) of the buffer to its requester
 	// when that needs no GPU work recorded here (the bytes are in the mapping and their last
 	// write is submitted, or downloads of them are). False, nothing done, otherwise.
