@@ -377,8 +377,10 @@ std::string MeasureLine(const std::string& head, double seconds) {
 		line += " | counters";
 		size_t index = 0;
 		for (const auto* counter = g_counters; counter != nullptr; counter = counter->Next()) {
-			line += Format(" %s=%.1f", counter->Name(),
-			               per_frame(end.named[index], begin.named[index]));
+			// (Three decimals for what happens a few times in the window: at one decimal a
+			// counter of ten events in ten seconds reads 0.0.)
+			const auto value = per_frame(end.named[index], begin.named[index]);
+			line += Format(value < 10.0 ? " %s=%.3f" : " %s=%.1f", counter->Name(), value);
 			index++;
 		}
 	}
