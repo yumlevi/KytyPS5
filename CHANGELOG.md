@@ -602,6 +602,12 @@ unmodified `saros` branch gave 37 fps and the first batch of changes below 47.9.
 - **A rendered image is no longer uploaded again from stale memory when a small unrelated buffer
   is written at its address** (Unreal reuses one block of memory for several resources in a
   frame): image uploads 320 to 130 MiB a frame, about +1 fps at 100%.
+- **The uploads that are left cost nothing that shows.** About 40 images are uploaded again in
+  every frame (59 MiB a frame at two spots of Saros with DLSS: a 128x72x96 fog volume of
+  12 MiB, 1280x720 targets, three images of different shapes at one address), most of them
+  after a GPU buffer write or a write of the game's over memory Unreal reuses. A test build
+  that skipped every one of them ran at the same 52.3 fps, with the GPU's time 1% lower. So
+  they stay as they are; `upload_log` (below) lists them.
 
 ### Shader translation
 
@@ -673,6 +679,10 @@ start. `present_crop` 1 to 9 shows a part of the picture pixel for pixel in the 
   `bindless_log 1` (`KYTY_BINDLESS_LOG=1`) a line for every shader that reads through the
   table, every heap made, every texture refused with the reason, and every entry the game
   rewrote while a shader used it. This is what found the two causes of the flat boxes above.
+- **Which images a frame uploads** (live switch `upload_log`: 1 for a few seconds, then 0): the
+  log then lists the images that uploaded the most, each with its memory, size, shape and
+  format, how often it was uploaded a frame, and after what (a GPU buffer write over its
+  memory, a write of the game's own, another image at that place).
 - **A play session can be played back along its path** (`replay <log> <from> [seconds]
   [oncamera]` on the live channel), as a benchmark of real play. A session's log already held
   every gamepad event with its time; it now also holds the camera of every frame (`Camera:`
