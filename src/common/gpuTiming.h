@@ -92,6 +92,7 @@ enum class StallKind : uint8_t {
 	Rewind,      // REWIND packet not yet valid.
 	Predication, // Occlusion-query results not ready.
 	Flip,        // The display buffer to render into is still being shown.
+	Readback,    // Bytes the GPU still writes are on their way; another queue runs meanwhile.
 	Count
 };
 

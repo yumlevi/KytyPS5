@@ -57,6 +57,8 @@ public:
 		uint32_t waiting  = 0; // Submissions queued, all queues.
 	};
 	[[nodiscard]] OtherWork OtherQueuesWork();
+	// Packets the GPU thread has run to their end, all queues.
+	[[nodiscard]] uint64_t PacketsRun() const noexcept { return m_packets_run; }
 
 private:
 	static constexpr uint32_t ComputePipeCount     = 7;
@@ -83,6 +85,9 @@ private:
 	bool              Process(Submission& submission);
 	static void       ThreadRun(void* data);
 	CommandProcessor& GetProcessor(uint32_t queue_id);
+	// (m_queue_mutex held.) A suspended submission that was put off for a readback whose
+	// submission the GPU has not finished: it stays blocked while other queues run.
+	[[nodiscard]] bool StillPutOff(const Submission& submission);
 
 	RenderContext&                                 m_renderer;
 	Common::Mutex                                  m_queue_mutex;
@@ -94,6 +99,7 @@ private:
 	std::atomic_uint32_t                           m_pending_commands {0};
 	uint32_t                                       m_next_queue        = 0;
 	uint32_t                                       m_running_queue     = UINT32_MAX;
+	uint64_t                                       m_packets_run       = 0;
 	uint32_t                                       m_submission_count  = 0;
 	bool                                           m_processing        = false;
 	bool                                           m_accepting         = true;
@@ -117,6 +123,15 @@ private:
 
 	friend class CommandProcessor;
 };
+
+// For what a dispatch reads on the host before it records anything (its resource walk, its
+// arguments): whether the dispatch is put off instead of waiting for the bytes of `ranges` the
+// GPU still writes. True only on the GPU thread, inside a dispatch packet, when some of the
+// bytes are the GPU's, another guest queue has a submission that can run, and something has run
+// since this packet was put off last; the bytes' download is then asked for, and the caller
+// returns without recording anything: the packet runs again later. False: go on (and wait).
+[[nodiscard]] bool PutOffForReadback(std::span<const std::pair<uint64_t, uint64_t>> ranges);
+
 } // namespace Libs::Graphics
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_GRAPHICSRUN_H_ */

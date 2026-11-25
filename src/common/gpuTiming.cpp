@@ -70,6 +70,7 @@ const char* StallKindName(StallKind kind) noexcept {
 		case StallKind::Rewind: return "rewind";
 		case StallKind::Predication: return "predication";
 		case StallKind::Flip: return "flip";
+		case StallKind::Readback: return "readback";
 		case StallKind::Count: break;
 	}
 	return "?";

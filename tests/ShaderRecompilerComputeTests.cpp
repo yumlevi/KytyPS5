@@ -19237,6 +19237,33 @@ public:
               scheduler.CurrentTick() == fault_tick && backing() == 0x55555555u,
               "the fault read submitted its own copy or returned stale bytes");
 
+      // Bytes asked for ahead of a read (a dispatch put off for them): the
+      // page was never read back, so its write was submitted without a
+      // download. Asked for, the bytes ride the next submission, and a read
+      // after it is served without a submission of its own.
+      {
+        constexpr uint64_t asked = target + 0x90000;
+        auto [asked_buffer, asked_offset] =
+            cache.ObtainBuffer(asked, bytes, true);
+        asked_buffer->Fill(asked_offset, bytes, 0x66666666u);
+        scheduler.Flush();
+        const std::pair<uint64_t, uint64_t> asked_range{asked, bytes};
+        cache.RequestAsyncReadback({&asked_range, 1});
+        gpu_fill(0x77777777u);
+        scheduler.Flush();
+        const auto asked_tick = scheduler.CurrentTick();
+        cache.ReadMemory(asked, bytes);
+        uint32_t asked_value = 0;
+        const bool asked_read = LibKernel::Memory::TryReadBacking(
+            asked + bytes - 4, &asked_value, sizeof(asked_value));
+        Require(name, "bytes asked for ahead",
+                asked_read && scheduler.CurrentTick() == asked_tick &&
+                    asked_value == 0x66666666u &&
+                    !cache.HasGpuDirtyBytes(asked, bytes),
+                "bytes asked for ahead did not ride the next submission");
+        cache.ReadMemory(target, bytes);
+      }
+
       // Over the per-submission cap, the pages read back most recently get
       // their downloads; the rest wait for a later submission and fault into
       // a readback meanwhile. Each page's write is 64 bytes, the cap two of

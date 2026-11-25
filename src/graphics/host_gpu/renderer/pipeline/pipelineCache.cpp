@@ -11,6 +11,7 @@
 #include "common/systemInfo.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -1718,6 +1719,17 @@ struct PipelineCache::ProgramCache {
 				}
 				bool materialized = adopted;
 				if (!adopted) {
+					if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+						// What the program's last walk waited for is with the GPU again, and the
+						// dispatch can be put off (another of the game's queues runs meanwhile):
+						// nothing is walked or recorded, the packet runs again once the bytes
+						// have arrived. (After the look-ahead's walk was tried: one that holds
+						// read nothing the GPU still writes.)
+						if (!cached.walk_read_backs.empty() &&
+						    Libs::Graphics::PutOffForReadback(cached.walk_read_backs)) {
+							return {};
+						}
+					}
 					read_cache.Prefetch(cached.walk_read_backs);
 					materialized = cached.Materialize(runtime, stage);
 					read_cache.Prefetch({});

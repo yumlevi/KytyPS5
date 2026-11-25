@@ -58,6 +58,14 @@ struct IndirectDrawRegisters {
 class Pm4Execution {
 public:
 	[[nodiscard]] bool MadeProgress() const noexcept { return m_made_progress; }
+	// Suspended at a packet that was put off for bytes the GPU still writes
+	// (CommandProcessor::PutOffForReadback): it can go on by waiting for them.
+	[[nodiscard]] bool PutOffForReadback() const noexcept {
+		return m_suspended && m_stall == Common::GpuTiming::StallKind::Readback;
+	}
+	// The submission its bytes were asked with: running the packet again before the GPU has
+	// finished it finds the bytes still missing.
+	[[nodiscard]] uint64_t PutOffTick() const noexcept { return m_put_off_tick; }
 
 private:
 	friend class CommandProcessor;
@@ -72,6 +80,17 @@ private:
 	bool                      m_chain         = false;
 	bool                      m_suspended     = false;
 	bool                      m_made_progress = false;
+	Common::GpuTiming::StallKind m_stall = Common::GpuTiming::StallKind::WaitRegMem;
+	// The packet being run; the packet that was put off for a readback last, with the first of
+	// the ranges it was put off for (a packet can read two things: its arguments, then what its
+	// walk loads), the tick of the submission those bytes were asked with, and how much work the
+	// GPU thread had done when it was put off last (GuestGpu::m_packets_run): put off again only
+	// once something else has run, and not past that submission.
+	const uint32_t* m_packet           = nullptr;
+	const uint32_t* m_put_off_packet   = nullptr;
+	uint64_t        m_put_off_address  = 0;
+	uint64_t        m_put_off_tick     = 0;
+	uint64_t        m_put_off_progress = 0;
 };
 
 class EmptyDrawPredictor;
@@ -157,6 +176,9 @@ public:
 	// runs after that work, but a page with a pending GPU write may keep its old bytes readable
 	// for the guest's CPU threads (BufferCache::NoteGpuWrite), so a plain read can be stale.
 	void SettleMemoryRead(const volatile void* address, uint64_t size, SettleSite site);
+	// Whether the packet being run is put off instead of waiting for the GPU-written bytes of
+	// `ranges` (graphicsRun.h, PutOffForReadback). Their download is asked for when it is.
+	[[nodiscard]] bool PutOffForReadback(std::span<const std::pair<uint64_t, uint64_t>> ranges);
 	// Reads a packet input when that takes no wait: pending labels are settled, and the bytes
 	// are read only if no recorded GPU work holds one of them (they are then the guest's and
 	// current). False, with nothing read, when the GPU holds some: the caller does without.
@@ -270,6 +292,9 @@ private:
 	// The buffer the stream enters next held GPU writes when it was called (ProcessIndirectBuffer
 	// read them back): a scan that passed it earlier read other commands.
 	bool m_lookahead_settled = false;
+	// The dispatch packet being run was put off for a readback (PutOffForReadback): its handler
+	// suspends the stream once the renderer has returned.
+	bool m_put_off = false;
 	// Whether the last scan stopped at a packet of `commands`.
 	[[nodiscard]] bool LookaheadStoppedIn(std::span<const uint32_t> commands) const {
 		return m_lookahead_active && m_lookahead_stop != nullptr &&

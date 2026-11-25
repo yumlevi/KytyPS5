@@ -141,6 +141,11 @@ public:
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasOnlyGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// (GPU thread.) The GPU-written bytes of the ranges are brought to guest memory without a
+	// wait: their pages join the hot set, at its front, and are downloaded with the next
+	// submission unless a download of their latest write is on its way. A caller that reads the
+	// bytes afterwards finds them in guest memory once that submission has run.
+	void RequestAsyncReadback(std::span<const std::pair<uint64_t, uint64_t>> ranges);
 	// Reads back the GPU-dirty bytes inside the (address, size) ranges, each dirty interval
 	// clipped to its range, so the backing holds every GPU write of the ranges recorded so far.
 	// Bytes outside the dirty intervals are neither read back nor looked up as buffers. All

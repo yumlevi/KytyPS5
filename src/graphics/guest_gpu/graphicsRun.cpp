@@ -47,6 +47,103 @@ namespace Libs::Graphics {
 static thread_local Pm4Execution* g_current_execution = nullptr;
 static thread_local GuestGpu*     g_gpu_state         = nullptr;
 
+// 1: a dispatch that would wait for bytes the GPU still writes (a value its resource walk reads,
+// the thread counts of an indirect dispatch) is put off while another of the game's queues can
+// run: the bytes' download is asked for, the packet is suspended as a WAIT_REG_MEM is, and this
+// thread runs the other queue until the bytes are in guest memory. 0: it waits, as before.
+//
+// Saros runs its GPU-driven culling in a compute queue: a pass writes a count, the next dispatch
+// sizes a buffer by it, and so on, four reads of GPU-written bytes a frame right after the
+// frame's heaviest GPU work. The first waited for all of that work, 4.5 ms of a 19 ms frame
+// with the GPU 25 submissions behind, while the graphics queue had 55 to 100 submissions of
+// the game waiting, one of them ready to run.
+//
+// A packet is put off only before it has recorded or changed anything, and only if something
+// else has run since it was put off last: with nothing else to run it waits, so two queues
+// that both cannot go on never spin. It is not run again before the GPU has finished the
+// submission its bytes were asked with (unless nothing else can run), and once that submission
+// has run it is not put off again for the same bytes: what is still with the GPU then was
+// written again or was not brought, and the packet waits for it.
+static Common::LiveControl::Switch  g_suspend_readback("suspend_readback", 1);
+// A frame: dispatches put off that way; times one of them was put off again; and dispatches
+// that waited although some of their bytes were the GPU's (no other queue could run, none had
+// since the last time, or the bytes did not come with their submission).
+static Common::LiveControl::Counter g_readback_put_offs("readback_put_offs");
+static Common::LiveControl::Counter g_readback_put_off_repeats("readback_put_off_repeats");
+static Common::LiveControl::Counter g_readback_put_off_denied("readback_put_off_denied");
+// The processor whose dispatch packet may be put off (set while its renderer call runs).
+static thread_local CommandProcessor* g_put_off_processor = nullptr;
+
+namespace {
+struct PutOffScope {
+	explicit PutOffScope(CommandProcessor* processor) { g_put_off_processor = processor; }
+	~PutOffScope() { g_put_off_processor = nullptr; }
+	KYTY_CLASS_NO_COPY(PutOffScope);
+};
+} // namespace
+
+bool PutOffForReadback(std::span<const std::pair<uint64_t, uint64_t>> ranges) {
+	auto* processor = g_put_off_processor;
+	return processor != nullptr && g_suspend_readback.On() && processor->PutOffForReadback(ranges);
+}
+
+bool CommandProcessor::PutOffForReadback(std::span<const std::pair<uint64_t, uint64_t>> ranges) {
+	if (g_current_execution == nullptr || g_gpu_state == nullptr) {
+		return false;
+	}
+	auto&      cache = m_renderer.GetBufferCache();
+	const auto dirty = [&] {
+		for (const auto& [address, size]: ranges) {
+			if (size != 0 && cache.HasGpuDirtyBytes(address, size)) {
+				return true;
+			}
+		}
+		return false;
+	};
+	if (ranges.empty() || !dirty()) {
+		return false;
+	}
+	auto&      execution = *g_current_execution;
+	auto&      scheduler = GetScheduler();
+	const bool again     = execution.m_put_off_packet == execution.m_packet &&
+	                       execution.m_put_off_address == ranges[0].first;
+	if (again && scheduler.IsFree(execution.m_put_off_tick)) {
+		// The submission the bytes were asked with has run. What the completion thread still
+		// publishes of it lands now; what is with the GPU after that was written again or was
+		// not brought (a download left for a later submission, a page gone from the hot set):
+		// putting the packet off longer cannot help, it waits for the bytes as before.
+		scheduler.WaitPriorityOperations(execution.m_put_off_tick);
+		if (dirty()) {
+			g_readback_put_off_denied.Add();
+		}
+		return false;
+	}
+	const auto run = g_gpu_state->PacketsRun();
+	if ((again && execution.m_put_off_progress == run) ||
+	    g_gpu_state->OtherQueuesWork().runnable == 0) {
+		g_readback_put_off_denied.Add();
+		return false;
+	}
+	cache.RequestAsyncReadback(ranges);
+	if (again) {
+		g_readback_put_off_repeats.Add();
+	} else {
+		// (The download rides the submission being recorded.)
+		execution.m_put_off_packet  = execution.m_packet;
+		execution.m_put_off_address = ranges[0].first;
+		execution.m_put_off_tick    = scheduler.CurrentTick();
+		g_readback_put_offs.Add();
+	}
+	execution.m_put_off_progress = run;
+	m_put_off                    = true;
+	return true;
+}
+
+bool GuestGpu::StillPutOff(const Submission& submission) {
+	return submission.blocked && submission.execution.PutOffForReadback() &&
+	       !m_renderer.GetCommandScheduler().IsFree(submission.execution.PutOffTick());
+}
+
 GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	m_gfx_cp = std::make_unique<CommandProcessor>(renderer, 0);
@@ -568,13 +665,17 @@ void GuestGpu::ThreadRun(void* data) {
 					// next poll (guest CPU stores are not reported). A write after the
 					// suspended streams last ran makes the sleep pointless.
 					uint64_t writes_seen = UINT64_MAX;
+					// (Not while a queue was only put off for a readback: run again now, with
+					// nothing else to run, it waits for its bytes and goes on.)
+					bool put_off = false;
 					for (const auto& queue: gpu->m_queues) {
 						if (!queue.empty() && queue.front().blocked) {
 							writes_seen = std::min(writes_seen, queue.front().blocked_writes);
+							put_off     = put_off || queue.front().execution.PutOffForReadback();
 						}
 					}
 					gpu->m_waiting_blocked.store(true);
-					if (gpu->m_memory_writes.load() == writes_seen) {
+					if (!put_off && gpu->m_memory_writes.load() == writes_seen) {
 						const auto start = std::chrono::steady_clock::now();
 						const bool signaled =
 						    gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
@@ -644,8 +745,14 @@ void GuestGpu::ThreadRun(void* data) {
 			gpu->m_queues[submission.queue_id].push_front(std::move(submission));
 			gpu->m_submission_count++;
 		} else {
+			// (A submission run to its end is work done, one without packets too.)
+			gpu->m_packets_run++;
+			// A queue put off for a readback is run again once the GPU has finished the
+			// submission its bytes ride, not after every submission another queue completes:
+			// each such run would scan the stream ahead again only to put the packet off again.
+			// (With nothing else to run it is run at once, see above.)
 			for (auto& queue: gpu->m_queues) {
-				if (!queue.empty()) {
+				if (!queue.empty() && !gpu->StillPutOff(queue.front())) {
 					queue.front().blocked = false;
 				}
 			}
@@ -1080,6 +1187,7 @@ void CommandProcessor::SuspendPm4(Common::GpuTiming::StallKind kind) {
 	EXIT_IF(g_current_execution == nullptr);
 	Common::GpuTiming::Sync().AddStall(kind);
 	g_current_execution->m_suspended = true;
+	g_current_execution->m_stall     = kind;
 }
 
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
@@ -1147,6 +1255,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			EXIT("unknown op\n\t%05" PRIx32 ":\n\tcmd_id = %08" PRIx32 "\n", offset, packet_header);
 		}
 
+		execution.m_packet = packet;
 		const bool lookahead_command = m_lookahead_active && IsLookaheadCommand(opcode);
 		if (lookahead_command) m_renderer.GetPipelineCache().SetLookaheadCommand(this, packet);
 		const auto packet_dw =
@@ -1159,6 +1268,10 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 		cursor.offset_dw += packet_dw;
 		execution.m_made_progress = true;
+		execution.m_put_off_packet = nullptr;
+		if (g_gpu_state != nullptr) {
+			g_gpu_state->m_packets_run++;
+		}
 		if (!execution.m_next_buffer.empty()) {
 			// Chains and taken branches reuse the fetcher; only calls retain a return cursor.
 			if (execution.m_chain) {
@@ -1954,8 +2067,16 @@ void CommandProcessor::SettleIndirectDrawState(bool registers, bool num_instance
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
                                       uint32_t thread_group_z, uint32_t mode) {
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
-	m_renderer.GetRenderExecutor().DispatchDirect(CurrentBuffer(), thread_group_x, thread_group_y,
-	                                              thread_group_z, mode, IsAsyncComputeQueue());
+	{
+		const PutOffScope scope(this);
+		m_renderer.GetRenderExecutor().DispatchDirect(CurrentBuffer(), thread_group_x,
+		                                              thread_group_y, thread_group_z, mode,
+		                                              IsAsyncComputeQueue());
+	}
+	// (The dispatch's walk asked for bytes the GPU still writes and recorded nothing.)
+	if (std::exchange(m_put_off, false)) {
+		SuspendPm4(Common::GpuTiming::StallKind::Readback);
+	}
 }
 
 void CommandProcessor::ProcessPssr(const Pssr::Request& request) {
@@ -1969,7 +2090,17 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 		// Thread dimensions are converted to workgroups on the host, so the arguments are read
 		// here, after the work recorded before this packet.
 		// Settled, the backing holds them; the guest mapping of the page may still fault on
-		// other GPU-written bytes.
+		// other GPU-written bytes. (Or the packet is put off until they have arrived.)
+		{
+			const std::pair<uint64_t, uint64_t> arguments {args_addr,
+			                                               sizeof(vk::DispatchIndirectCommand)};
+			const PutOffScope                   scope(this);
+			if (Libs::Graphics::PutOffForReadback({&arguments, 1u})) {
+				m_put_off = false;
+				SuspendPm4(Common::GpuTiming::StallKind::Readback);
+				return;
+			}
+		}
 		SettleMemoryRead(reinterpret_cast<const void*>(args_addr),
 		                 sizeof(vk::DispatchIndirectCommand), SettleSite::DispatchArgs);
 		vk::DispatchIndirectCommand args {};
@@ -1991,8 +2122,14 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 			return;
 		}
 	}
-	m_renderer.GetRenderExecutor().DispatchIndirect(CurrentBuffer(), args_addr, mode,
-	                                                IsAsyncComputeQueue());
+	{
+		const PutOffScope scope(this);
+		m_renderer.GetRenderExecutor().DispatchIndirect(CurrentBuffer(), args_addr, mode,
+		                                                IsAsyncComputeQueue());
+	}
+	if (std::exchange(m_put_off, false)) {
+		SuspendPm4(Common::GpuTiming::StallKind::Readback);
+	}
 }
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {

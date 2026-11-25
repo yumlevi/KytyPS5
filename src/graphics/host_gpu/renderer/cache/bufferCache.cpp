@@ -1945,6 +1945,20 @@ void BufferCache::WaitGuestCopies(BufferId id) {
 	});
 }
 
+void BufferCache::RequestAsyncReadback(std::span<const std::pair<uint64_t, uint64_t>> ranges) {
+	for (const auto& [vaddr, size]: ranges) {
+		if (size == 0 || !m_gpu_modified_ranges.Intersects(vaddr, size)) {
+			continue;
+		}
+		TouchHotPages(vaddr, size);
+		if (SubmittedDownloadTick(vaddr, size) != 0) {
+			continue;
+		}
+		const auto first = vaddr & ~(CACHING_PAGESIZE - 1u);
+		m_pending_async.Add(first, Common::AlignUp(vaddr + size, CACHING_PAGESIZE) - first);
+	}
+}
+
 uint64_t BufferCache::SubmittedDownloadTick(uint64_t vaddr, uint64_t size) {
 	uint64_t wait_tick = 0;
 	bool     covered   = true;
