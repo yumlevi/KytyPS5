@@ -180,6 +180,27 @@ with them; other places and machines will differ.
   built ahead; a list for Saros is included.
 - **At every start**, the recorded programs are translated on helper threads and recorded
   pipelines are built in the background before they are needed.
+- **Translated shaders are kept on disk between starts** (`_PipelineCache/<title>.v1.modules`,
+  `module_store`). A session translated 12,600 programs into 19,900 modules in the background
+  during its first 70 to 80 seconds, 250 s of CPU time, and the frame rate was a fifth lower
+  while that ran: half of it was writing the Vulkan shader code, which is the same at every
+  start. That half is now read back from a file (664 MiB for Saros, compressed) that the
+  first start after an update fills; a second start takes all 19,871 modules from it and
+  compiles none. A module is checked when it is stored (read back and compared) and the file
+  belongs to one build of the emulator, one graphics device and one set of shader settings.
+- **The game's first frame waits until the shaders prepared ahead are ready** (`prepare_hold`:
+  the most seconds, 90; `KYTY_PREPARE_HOLD=0` for no wait). With the store filled that is
+  about 15 s on an i9-13900K, during which every thread works on them, instead of two minutes
+  of play at a lower frame rate: the first three ten-second windows of a played-back session
+  41.5, 46.3 and 42.4 fps before, 51.4, 52.7 and 45.9 after.
+- **Shader work that runs beside the game stays on the efficiency cores** of a CPU that has
+  eight or more of them (`background_ecores`), so it does not take turns with the threads that
+  make frames.
+- **A faster memory allocator on PCs with 28 GiB of RAM or more** (mimalloc, from the DS fork;
+  `KYTY_MIMALLOC=0` or `1` decides instead). Shader translation spends about a third of its
+  time allocating, and its threads waited for each other at the one heap: the wait before the
+  first frame went from 22.0 to 15.1 s, and the thread that feeds the GPU works 0.7 ms a frame
+  less.
 - **"Never wait for a new graphics shader"** (`--skip-pending-draws`): a graphics shader met for
   the first time is built in the background and its draw is left out until it is ready, instead
   of the game stopping.
@@ -457,6 +478,30 @@ unmodified `saros` branch gave 37 fps and the first batch of changes below 47.9.
   played back, one run each way: pages changed by the GPU thread 19,000–36,000 to
   3,800–6,200 a frame, that thread's CPU time 17.8–18.3 to 16.7 ms a frame, 45.4–47.7 to
   49.8 fps (`keep_marked`).
+- **The look for things to release before each draw no longer sleeps.** Buffers and images
+  given back are released once the GPU has finished with them and their submission's results
+  have been delivered. The thread asked before every draw and dispatch, some 1,500 times a
+  frame: a question to the driver and a lock each time, and where something was due, a sleep
+  until the delivering thread had caught up, 0.42 ms a frame. It now asks only when the oldest
+  entry can be due, without the lock, and leaves an entry for the next draw instead of
+  sleeping (`pop_no_wait`).
+- **The pages the game reads back are checked and protected by runs, not one at a time.**
+  What a download delivered was taken off the list of bytes the GPU still holds with a
+  question and a subtraction for each 4 KiB page, 6,700 pages a frame: adjacent pages are now
+  one question and one subtraction, 470 a frame (`drain_runs`). And the pages a GPU write
+  makes unreadable took a locked question and a protection request each: all pages of a write
+  are now handled with one request per region, 933 to 591 requests a frame
+  (`unreadable_merged`). With the item above, switched off and on six times in one played-back
+  session: 15.13 to 14.64 ms of the thread's CPU time a frame.
+- **A protection change inside the mapping a thread asked about last skips the search for it**
+  among some thousands of mappings (from the DS fork).
+- **Command buffers are no longer ended early for colour metadata nobody reads on the CPU.** A
+  compute pass that writes a render target's fast-clear data ended the command buffer at once,
+  so that a read of that data on the CPU would wait for little. Saros's is always checked on
+  the GPU, never on the CPU: 340 to 450 submissions a second were for nothing, 94–97
+  submissions a frame are now 89–93. A range is treated that way only once it has been read
+  on the CPU. (With it, upstream's change that compares such data a block at a time without
+  allocating.)
 - The GPU thread runs above the game's own threads.
 
 ### Readbacks (the game reading what the GPU wrote)
@@ -495,11 +540,16 @@ unmodified `saros` branch gave 37 fps and the first batch of changes below 47.9.
   `skip_empty_indirect` on against 0 of 26 with one or both off. That neither convicts nor
   clears them, the same loss was seen once before either existed, and neither makes a frame
   faster, so they wait for the cause.
-- **A store of the command stream over bytes the GPU wrote stays on the GPU** (`write_data_gpu`):
-  up to four words are filled into the buffer in the order of the commands instead of being
-  fetched back first. Saros does that with one word about every second frame; it made no
-  difference to a played-back session, because nearly all waits for a store are for the
-  game's own threads' stores.
+- **A store of the command stream over bytes the GPU wrote is not fetched back first**
+  (`write_data_gpu`, `write_data_gpu_words`, `store_both`): its words are copied into the
+  buffer in the order of the commands, and written into the game's memory as well, where they
+  stop counting as bytes someone has to wait for. Saros writes one word that way about every
+  second frame and a record of 56 words every frame; for the record the thread that feeds the
+  GPU stopped 0.85 times a frame until the GPU had caught up. Those stops are gone, and the
+  frame rate is the same (19.60 against 19.64 ms of that thread a frame): the next read of
+  GPU-written bytes, a third of a millisecond later, now waits for the same work. The finding
+  is in "Not done" below: the waits of a frame come one after the other, and the first pays
+  for all.
 
 ### Textures
 
@@ -523,7 +573,9 @@ Most of the changes above can be turned off while the game runs, through the liv
 `fault_ahead`, `game_upscaler`, `game_upscaler_skip`, `flip_when_done`, `hot_window`,
 `hot_pages_max`, `store_ahead`, `store_ahead_gpu`, `store_free_factor`, `store_gpu_min`,
 `readback_ahead`, `unmap_precise`, `lock_sleep`, `publish_first`, `keep_marked`,
-`write_data_gpu`. Each also reads an environment variable `KYTY_<NAME>` at
+`write_data_gpu`, `write_data_gpu_words`, `store_both`, `pop_no_wait`, `drain_runs`,
+`unreadable_merged`, `module_store`, `prepare_hold`, `background_ecores`. Each also reads an
+environment variable `KYTY_<NAME>` at
 start. `present_crop` 1 to 9 shows a part of the picture pixel for pixel in the window.
 
 ## Tools for measuring
@@ -591,6 +643,18 @@ start. `present_crop` 1 to 9 shows a part of the picture pixel for pixel in the 
   half minutes; and `store_gpu_kb`, `store_gpu_us` for the same bytes brought by a copy on
   the GPU. Counters under ten a frame are printed with three decimals, so what happens a few
   times in a window can be counted from its line.
+- **What the thread that feeds the GPU waits for, by cause.** Counters in the performance log:
+  `sync_passes`, `sync_gpu_us`, `sync_completion_us` (its waits and their two parts),
+  `sync_read_own`/`sync_store_own`/`sync_read_guest`/`sync_store_guest` (who asked),
+  `settle_*` (the command stream's own reads, by kind), `walk_readbacks`,
+  `write_data_fetched`, `handoff_*` (why a game thread's readback was not handed to it). Live
+  switches that write a line per event: `sync_log` (what was read, how long the wait was, how
+  far the GPU was behind, which of the game's queues runs and whether another could),
+  `walk_read_log` (the shader and the bytes), `settle_log`. At start,
+  `KYTY_WALK_EXPLAIN=<shader hash,...>` prints what a shader's resource table walk computes
+  from what it loads, and `KYTY_WATCH_WRITE=<address,...>` names the shaders that bind an
+  address for writing and how much they bind around it. The performance log's lines end with
+  the emulator's memory (`mem_mb working`, `private`, `free`).
 - `readback_log` (live switch, for a few seconds) writes a line for every readback a game
   thread's read asks for and for every store of the GPU thread into GPU-written pages;
   `stale_readable 0` with the counter `early_reads` counts reads that arrive before the
@@ -617,11 +681,22 @@ start. `present_crop` 1 to 9 shows a part of the picture pixel for pixel in the 
 
 - Table mode of the DS fork is not ported: as written it takes only draws without bound vertex
   buffers, which is 3% of Saros's draws. Its ideas that carry over are in the list above.
-- The thread that feeds the GPU still waits about 5 times a frame at a heavy spot for bytes the
-  GPU writes and the host needs itself, and time saved before those waits comes back as longer
-  waits. An upload worker for the per-draw uploads (the DS fork's scope) cut that thread's
-  copies and page protections by 5% of its time and changed no frame rate for that reason; it
-  is not in.
+- **The thread that feeds the GPU still waits 5 times a frame, 5.5 ms of a 19 ms frame**, for
+  bytes the GPU writes and the host needs itself, and what they are is now known (a played-back
+  session, 1440p with DLSS): the waits come one after the other, right after the frame's
+  heaviest GPU work, so the first pays for all of that work and the others are short. In
+  order: a compute shader takes the record count of a buffer from a number a culling pass
+  just wrote (4.5 ms: the GPU is 25 submissions behind there); an indirect dispatch reads its
+  thread counts (0.2 ms); a shader reads a header word that never changes but lies in a block
+  of memory its writers bind whole (0.1 ms); a second indirect dispatch (0.2 ms); and the
+  graphics queue calls a 35 KiB command list the GPU wrote (0.3 ms). Removing one only moves
+  the wait to the next, measured twice. The first four run in one of the game's compute queues
+  while its graphics queue has commands that could run: the next step is to put the waiting
+  command aside and feed the other queue until the bytes have arrived, as a wait for a label
+  already does.
+- Time saved before those waits comes back as longer waits: an upload worker for the per-draw
+  uploads (the DS fork's scope) cut that thread's copies and page protections by 5% of its
+  time and changed no frame rate for that reason; it is not in.
 - The DS fork's merged page protections are not ported: they join protections of adjacent
   pages that follow each other, of which Demon's Souls has about 110 a frame and Saros one.
 - Cards of 12 GB and less are not confirmed. With the rest of a 24 GB card taken away
