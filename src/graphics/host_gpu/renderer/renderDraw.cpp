@@ -1438,7 +1438,7 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
-	m_context.GetCommandScheduler().PopPendingOperations();
+	m_context.GetCommandScheduler().TryPopPendingOperations();
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -1533,7 +1533,7 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
-	m_context.GetCommandScheduler().PopPendingOperations();
+	m_context.GetCommandScheduler().TryPopPendingOperations();
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -1659,7 +1659,7 @@ DrawIndirectResult RenderExecutor::DrawIndirect(CommandBuffer&            buffer
 		return ReadArguments;
 	}
 
-	m_context.GetCommandScheduler().PopPendingOperations();
+	m_context.GetCommandScheduler().TryPopPendingOperations();
 	Common::LockGuard lock(m_context.GetMutex());
 	if (!DrawHasValidVertexShader(sh_ctx)) {
 		CountUnissuedDraw();

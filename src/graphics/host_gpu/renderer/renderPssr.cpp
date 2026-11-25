@@ -303,7 +303,7 @@ void RenderExecutor::UpscaleGameFrame(CommandBuffer& buffer, const PreparedBindi
 }
 
 void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& request) {
-	m_context.GetCommandScheduler().PopPendingOperations();
+	m_context.GetCommandScheduler().TryPopPendingOperations();
 	Common::LockGuard lock(m_context.GetMutex());
 	ShaderTextureResource input_descriptor {}, output_descriptor {};
 	std::copy_n(request.input, 8, input_descriptor.fields);

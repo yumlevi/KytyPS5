@@ -3,12 +3,16 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/gpuTiming.h"
+#include "common/liveControl.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <chrono>
 #include <cinttypes>
 
 namespace Libs::Graphics {
+
+// Reads of the GPU's timeline (vkGetSemaphoreCounterValue), all threads.
+static Common::LiveControl::Counter g_timeline_reads("timeline_reads");
 
 MasterSemaphore::MasterSemaphore(GraphicContext& graphics): m_graphics(graphics) {
 	vk::SemaphoreTypeCreateInfo type_info {};
@@ -27,6 +31,7 @@ MasterSemaphore::~MasterSemaphore() {
 }
 
 void MasterSemaphore::Refresh() {
+	g_timeline_reads.Add();
 	uint64_t   counter = 0;
 	const auto result  = m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
 	if (result != vk::Result::eSuccess) {

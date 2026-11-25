@@ -29,6 +29,26 @@ static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
 // made hot, in 3 of 5 test runs of a level within 20 to 65 seconds.
 static Common::LiveControl::Switch g_publish_first("publish_first", 1);
 
+// 1: the drain of deferred operations before a draw or dispatch (TryPopPendingOperations) leaves
+// an operation queued while the completion thread is still at its submission's priority
+// operations, and takes it at a later draw; 0: it sleeps until that thread is through, as before.
+//
+// A deferred operation (a buffer or image given back, a staging range released) runs once the
+// GPU has finished its submission and that submission's publications and labels have run, which
+// the completion thread does. The GPU thread asked at every draw and dispatch (1,650 a frame in
+// Saros) whether one was due: a read of the GPU's timeline and a lock each time, and where one
+// was, a sleep on the completion thread, 3.6 to 4.8% of this thread in a profile of play. Nothing
+// needs the operation run at that draw: it only frees what the submission no longer uses.
+static Common::LiveControl::Switch  g_pop_no_wait("pop_no_wait", 1);
+// Operations the drain before a draw ran; polls that found one finished on the GPU and the
+// completion thread not through with its tick; what the drain slept for it (pop_no_wait 0).
+static Common::LiveControl::Counter g_pending_ops("pending_ops");
+static Common::LiveControl::Counter g_pending_deferred("pending_deferred");
+static Common::LiveControl::Counter g_pending_wait_us("pending_wait_us");
+// What the callers of WaitPriorityOperations slept on the completion thread, all threads
+// together (with pop_no_wait 0 the drain's sleep is in it as well).
+static Common::LiveControl::Counter g_prio_wait_us("prio_wait_us");
+
 CommandScheduler::CommandPool::CommandPool(GraphicContext& graphics, MasterSemaphore& master)
     : m_graphics(graphics), m_master(master) {
 	EXIT_IF(graphics.queue_family == static_cast<uint32_t>(-1));
@@ -212,6 +232,14 @@ void CommandScheduler::WaitTick(uint64_t tick) {
 	}
 }
 
+void CommandScheduler::NotePendingFront() {
+	m_pending_front_tick.store(m_pending_operations.empty() ? UINT64_MAX
+	                                                         : m_pending_operations.front().tick,
+	                           std::memory_order_release);
+	m_pending_operation_count.store(static_cast<uint32_t>(m_pending_operations.size()),
+	                                std::memory_order_release);
+}
+
 void CommandScheduler::PopPendingOperations() {
 	m_master.Refresh();
 	for (;;) {
@@ -224,8 +252,57 @@ void CommandScheduler::PopPendingOperations() {
 			}
 			operation = std::move(m_pending_operations.front());
 			m_pending_operations.pop();
+			NotePendingFront();
 		}
 		WaitPriorityOperations(operation.tick);
+		RunOperation(std::move(operation.callback));
+	}
+}
+
+void CommandScheduler::TryPopPendingOperations() {
+	// Nothing is queued, or the oldest waits for a submission the driver has not been handed
+	// (the open buffer): the GPU cannot have run it. No timeline read, no lock.
+	if (m_pending_operation_count.load(std::memory_order_acquire) == 0) {
+		return;
+	}
+	const auto front = m_pending_front_tick.load(std::memory_order_acquire);
+	if (front >= CurrentTick()) {
+		return;
+	}
+	if (!m_master.IsFree(front)) {
+		m_master.Refresh();
+		if (!m_master.IsFree(front)) {
+			return;
+		}
+	}
+	const bool no_wait = g_pop_no_wait.On();
+	for (;;) {
+		PendingOperation operation;
+		{
+			std::lock_guard lock(m_operation_mutex);
+			if (m_pending_operations.empty() ||
+			    !m_master.IsFree(m_pending_operations.front().tick)) {
+				return;
+			}
+			// In order: an operation the completion thread has not caught up with holds the
+			// ones behind it back as well.
+			if (no_wait && PriorityOperationsUpTo(m_pending_operations.front().tick)) {
+				g_pending_deferred.Add();
+				return;
+			}
+			operation = std::move(m_pending_operations.front());
+			m_pending_operations.pop();
+			NotePendingFront();
+		}
+		if (!no_wait) {
+			const auto begin = std::chrono::steady_clock::now();
+			WaitPriorityOperations(operation.tick);
+			g_pending_wait_us.Add(static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+			                                                          begin)
+			        .count()));
+		}
+		g_pending_ops.Add();
 		RunOperation(std::move(operation.callback));
 	}
 }
@@ -266,7 +343,14 @@ uint64_t CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operati
 			m_last_priority_tick = tick;
 			m_priority_operations.push_back({std::move(operation), tick, writes, first});
 		} else {
+			// (The hints of TryPopPendingOperations: the oldest's tick before the count, so
+			// that a reader that sees an operation sees its tick.)
+			if (m_pending_operations.empty()) {
+				m_pending_front_tick.store(tick, std::memory_order_release);
+			}
 			m_pending_operations.push({std::move(operation), tick});
+			m_pending_operation_count.store(static_cast<uint32_t>(m_pending_operations.size()),
+			                                std::memory_order_release);
 		}
 		m_last_queued_tick = std::max(m_last_queued_tick, tick);
 		lock.unlock();
@@ -368,16 +452,24 @@ void CommandScheduler::DrainPriorityOperations() {
 	    lock, [this] { return m_priority_operations.empty() && m_priority_active_tick == 0; });
 }
 
+bool CommandScheduler::PriorityOperationsUpTo(uint64_t tick) const {
+	const bool active_before_or_at = m_priority_active_tick != 0 && m_priority_active_tick <= tick;
+	const bool queued_before_or_at =
+	    !m_priority_operations.empty() && m_priority_operations.front().tick <= tick;
+	return active_before_or_at || queued_before_or_at;
+}
+
 void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
 	EXIT_IF(g_deferred_callback_scheduler == this);
 	std::unique_lock lock(m_operation_mutex);
-	m_operation_available.wait(lock, [this, tick] {
-		const bool active_before_or_at =
-		    m_priority_active_tick != 0 && m_priority_active_tick <= tick;
-		const bool queued_before_or_at =
-		    !m_priority_operations.empty() && m_priority_operations.front().tick <= tick;
-		return !active_before_or_at && !queued_before_or_at;
-	});
+	if (!PriorityOperationsUpTo(tick)) {
+		return;
+	}
+	const auto begin = std::chrono::steady_clock::now();
+	m_operation_available.wait(lock, [this, tick] { return !PriorityOperationsUpTo(tick); });
+	g_prio_wait_us.Add(static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin)
+	        .count()));
 }
 
 void CommandScheduler::RunOperation(Common::UniqueFunction<void>&& operation) {

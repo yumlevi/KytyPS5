@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -53,7 +54,15 @@ public:
 	// the priority runner cannot join itself.
 	void                      Shutdown();
 	void                      Wait(uint64_t tick);
+	// Runs the deferred operations whose submission the GPU has finished, each after the
+	// completion thread is through with that submission's priority operations (it waits for
+	// that thread: for callers that need the operations run, the end of a frame, a shutdown,
+	// the fault buffer's reuse).
 	void                      PopPendingOperations();
+	// The same before a draw or a dispatch, without a wait: an operation the completion thread
+	// has not caught up with stays queued for the next call (the pop_no_wait switch), and
+	// nothing is read from the driver or locked while the oldest one cannot be due.
+	void                      TryPopPendingOperations();
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);
 	// Guest-memory completions use the priority queue; normal callbacks maintain GPU resources.
@@ -129,6 +138,11 @@ private:
 	                        bool after_recorded = false, GuestWrites writes = {}, bool first = false);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
 	void WaitTick(uint64_t tick);
+	// (m_operation_mutex held.) Whether the completion thread still has a priority operation of
+	// `tick` or an earlier one queued or running.
+	[[nodiscard]] bool PriorityOperationsUpTo(uint64_t tick) const;
+	// (m_operation_mutex held, after a pop.) Brings the two hints below up to date.
+	void NotePendingFront();
 
 	MasterSemaphore              m_master;
 	RenderContext&               m_context;
@@ -138,6 +152,11 @@ private:
 	CommandBuffer                m_command;
 	DynamicState                 m_dynamic_state;
 	std::queue<PendingOperation> m_pending_operations;
+	// Hints for TryPopPendingOperations, written under m_operation_mutex only: how many
+	// operations are queued and the tick the oldest waits for (UINT64_MAX: none). They may only
+	// make a call return early; what is popped is decided under the mutex.
+	std::atomic<uint32_t> m_pending_operation_count {0};
+	std::atomic<uint64_t> m_pending_front_tick {UINT64_MAX};
 	std::deque<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;
 	std::condition_variable      m_operation_available;

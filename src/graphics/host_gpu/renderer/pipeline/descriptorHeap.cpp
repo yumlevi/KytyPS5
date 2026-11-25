@@ -50,6 +50,8 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
 	}
 
 	m_pending_pools.emplace_back(m_current_pool, m_master_semaphore.CurrentTick());
+	// (The GPU's tick as it is now: no other call of the draw path refreshes it any more.)
+	m_master_semaphore.Refresh();
 	if (const auto& [pool, tick] = m_pending_pools.front(); m_master_semaphore.IsFree(tick)) {
 		m_current_pool = pool;
 		m_pending_pools.pop_front();

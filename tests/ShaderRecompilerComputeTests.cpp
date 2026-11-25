@@ -2907,6 +2907,71 @@ public:
     Require("SchedulerTimeline", "implicit boundary", completed == 3,
             "operation boundary did not release the implicit tick callback");
 
+    // The drain before a draw. An empty queue, and one whose oldest operation
+    // waits for the open buffer, read no timeline; a tick finished unobserved
+    // still releases its operation.
+    {
+      static uint32_t counter_queries = 0;
+      static PFN_vkGetSemaphoreCounterValue get_counter = nullptr;
+      auto &dispatcher = VULKAN_HPP_DEFAULT_DISPATCHER;
+      get_counter = std::exchange(dispatcher.vkGetSemaphoreCounterValue,
+                                  [](auto... args) {
+                                    ++counter_queries;
+                                    return get_counter(args...);
+                                  });
+      scheduler.TryPopPendingOperations();
+      const auto empty_queries = counter_queries;
+      const auto unobserved_tick = scheduler.CurrentTick();
+      scheduler.DeferOperation([&completed] { completed = 4; });
+      scheduler.TryPopPendingOperations();
+      const auto open_queries = counter_queries;
+      const auto open_completed = completed;
+      scheduler.Flush();
+      const auto timeline = scheduler.GetMasterSemaphore().Handle();
+      vk::SemaphoreWaitInfo unobserved_wait{};
+      unobserved_wait.semaphoreCount = 1;
+      unobserved_wait.pSemaphores = &timeline;
+      unobserved_wait.pValues = &unobserved_tick;
+      const bool signaled =
+          m_runtime_context.device.waitSemaphores(&unobserved_wait,
+                                                  UINT64_MAX) ==
+          vk::Result::eSuccess;
+      scheduler.TryPopPendingOperations();
+      dispatcher.vkGetSemaphoreCounterValue = get_counter;
+      Require("SchedulerTimeline", "draw drain refresh",
+              empty_queries == 0 && open_queries == 0 && open_completed == 3 &&
+                  signaled && completed == 4,
+              "the drain before a draw read the timeline for nothing, or left "
+              "a finished tick's operation queued");
+    }
+
+    // It does not wait for the completion thread: an operation whose
+    // submission's priority operations are still running stays queued, with
+    // the ones behind it, and they run in order at a later call.
+    {
+      const auto held_tick = scheduler.CurrentTick();
+      std::binary_semaphore held_entered{0};
+      std::binary_semaphore held_release{0};
+      scheduler.DeferPriorityOperation([&held_entered, &held_release] {
+        held_entered.release();
+        held_release.acquire();
+      });
+      scheduler.DeferOperation([&completed] { completed = 5; });
+      scheduler.DeferOperation(
+          [&completed] { completed = completed == 5 ? 6 : 0; });
+      scheduler.Flush();
+      held_entered.acquire();
+      scheduler.TryPopPendingOperations();
+      const auto held_back = completed;
+      held_release.release();
+      scheduler.WaitPriorityOperations(held_tick);
+      scheduler.TryPopPendingOperations();
+      Require("SchedulerTimeline", "draw drain without a wait",
+              held_back == 4 && completed == 6,
+              "the drain before a draw ran an operation ahead of its "
+              "submission's priority operations, or out of order");
+    }
+
     // Nothing recorded (a barrier at most) and nothing waiting for the tick:
     // a flush keeps the buffer, and an operation that depends only on
     // recorded work completes with the previous submission.
