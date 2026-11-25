@@ -17,6 +17,125 @@
 #include <vector>
 #include <magic_enum.hpp>
 
+#if defined(KYTY_MIMALLOC)
+#include <atomic>
+#include <cstdlib>
+#include <malloc.h>
+#include <mimalloc.h>
+#include <new>
+#include <windows.h> // IWYU pragma: keep
+
+// The executable's operator new/delete (this translation unit only; after the Demon's Souls
+// fork's d36975759): mimalloc's, or with KYTY_MIMALLOC=0 the CRT heap's, chosen at the first
+// allocation from the environment and kept for the process (a block is always freed by the heap
+// that made it). The allocations of the drivers and of the other modules stay on the process
+// heap.
+//
+// The shader recompiler allocates a node for every value of a program and frees them all again:
+// a third of a translating thread's time was the CRT heap, and with many threads at it the heap
+// was what limited them (12,400 programs in 22 s on 28 threads, where eight make them in 59).
+// The thread that feeds the GPU spends 2 to 3% of its time in the same heap.
+//
+// mimalloc keeps what it frees for longer than the CRT heap does (the Demon's Souls fork
+// measured 2 to 3.6 GB more private memory over a long session, 637343ec6), so without the
+// variable it is taken only on a PC with MimallocMinRamGiB of physical memory or more: a PC with
+// 32 GB (Windows reports about 31.9 GiB) has it, one with 16 or 24 GB keeps the CRT heap.
+// Nothing on this path may allocate: it runs inside the first operator new. The variable is
+// read before main, so it has to be set by whatever starts the emulator.
+constexpr unsigned long long MimallocMinRamGiB = 28;
+// -1: not chosen yet; 0: the CRT heap, asked for; 1: the CRT heap, for this PC's memory;
+// 2: mimalloc, asked for; 3: mimalloc.
+static std::atomic<int> g_kyty_heap {-1};
+static int              KytyHeapChoice() noexcept {
+    if (const int chosen = g_kyty_heap.load(std::memory_order_acquire); chosen >= 0) {
+        return chosen;
+    }
+    int         choice = 3;
+    const char* value  = std::getenv("KYTY_MIMALLOC");
+    if (value != nullptr && value[0] != '\0') {
+        choice = value[0] != '0' ? 2 : 0;
+    } else {
+        MEMORYSTATUSEX memory {};
+        memory.dwLength = sizeof(memory);
+        if (GlobalMemoryStatusEx(&memory) != 0 && memory.ullTotalPhys < (MimallocMinRamGiB << 30u)) {
+            choice = 1;
+        }
+    }
+    // (Two threads at their first allocation: the first choice stands for both.)
+    int expected = -1;
+    if (!g_kyty_heap.compare_exchange_strong(expected, choice, std::memory_order_acq_rel)) {
+        return expected;
+    }
+    return choice;
+}
+static bool KytyMimalloc() noexcept {
+	return KytyHeapChoice() >= 2;
+}
+static void* KytyAlloc(std::size_t size) noexcept {
+	return KytyMimalloc() ? mi_malloc(size) : std::malloc(size == 0 ? 1 : size);
+}
+static void* KytyAllocAligned(std::size_t size, std::align_val_t align) noexcept {
+	return KytyMimalloc() ? mi_malloc_aligned(size, static_cast<std::size_t>(align))
+	                      : _aligned_malloc(size == 0 ? 1 : size, static_cast<std::size_t>(align));
+}
+static void KytyFree(void* p) noexcept {
+	if (KytyMimalloc()) {
+		mi_free(p);
+	} else {
+		std::free(p);
+	}
+}
+static void KytyFreeAligned(void* p) noexcept {
+	if (KytyMimalloc()) {
+		mi_free(p);
+	} else {
+		_aligned_free(p);
+	}
+}
+// (An allocation that fails ends the process, as an uncaught std::bad_alloc would.)
+static void* KytyNew(std::size_t size) {
+	if (void* p = KytyAlloc(size)) {
+		return p;
+	}
+	std::abort();
+}
+static void* KytyNewAligned(std::size_t size, std::align_val_t align) {
+	if (void* p = KytyAllocAligned(size, align)) {
+		return p;
+	}
+	std::abort();
+}
+
+void* operator new(std::size_t size) { return KytyNew(size); }
+void* operator new[](std::size_t size) { return KytyNew(size); }
+void* operator new(std::size_t size, const std::nothrow_t&) noexcept { return KytyAlloc(size); }
+void* operator new[](std::size_t size, const std::nothrow_t&) noexcept { return KytyAlloc(size); }
+void* operator new(std::size_t size, std::align_val_t align) { return KytyNewAligned(size, align); }
+void* operator new[](std::size_t size, std::align_val_t align) { return KytyNewAligned(size, align); }
+void* operator new(std::size_t size, std::align_val_t align, const std::nothrow_t&) noexcept {
+	return KytyAllocAligned(size, align);
+}
+void* operator new[](std::size_t size, std::align_val_t align, const std::nothrow_t&) noexcept {
+	return KytyAllocAligned(size, align);
+}
+void operator delete(void* p) noexcept { KytyFree(p); }
+void operator delete[](void* p) noexcept { KytyFree(p); }
+void operator delete(void* p, std::size_t) noexcept { KytyFree(p); }
+void operator delete[](void* p, std::size_t) noexcept { KytyFree(p); }
+void operator delete(void* p, const std::nothrow_t&) noexcept { KytyFree(p); }
+void operator delete[](void* p, const std::nothrow_t&) noexcept { KytyFree(p); }
+void operator delete(void* p, std::align_val_t) noexcept { KytyFreeAligned(p); }
+void operator delete[](void* p, std::align_val_t) noexcept { KytyFreeAligned(p); }
+void operator delete(void* p, std::size_t, std::align_val_t) noexcept { KytyFreeAligned(p); }
+void operator delete[](void* p, std::size_t, std::align_val_t) noexcept { KytyFreeAligned(p); }
+void operator delete(void* p, std::align_val_t, const std::nothrow_t&) noexcept {
+	KytyFreeAligned(p);
+}
+void operator delete[](void* p, std::align_val_t, const std::nothrow_t&) noexcept {
+	KytyFreeAligned(p);
+}
+#endif
+
 #if defined(KYTY_PGO_GENERATE)
 #include <chrono>
 #include <cstdlib>
@@ -703,6 +822,23 @@ static int Main(int argc, char* argv[]) {
 		return 0;
 	}
 
+#if defined(KYTY_MIMALLOC)
+	// The heap this process's operator new/delete took (fixed at the first allocation), and why.
+	switch (KytyHeapChoice()) {
+		case 0: std::printf("Heap: the CRT heap (KYTY_MIMALLOC=0)\n"); break;
+		case 1:
+			std::printf("Heap: the CRT heap (less than %llu GiB of physical memory; KYTY_MIMALLOC=1 "
+			            "takes mimalloc all the same)\n",
+			            MimallocMinRamGiB);
+			break;
+		default:
+			std::printf("Heap: mimalloc %d.%d.%d (vendored)%s\n", MI_MALLOC_VERSION / 10000,
+			            MI_MALLOC_VERSION / 100 % 100, MI_MALLOC_VERSION % 100,
+			            KytyHeapChoice() == 2 ? " (KYTY_MIMALLOC=1)" : "");
+			break;
+	}
+#endif
+
 	Run(options);
 
 	return 0;
@@ -768,7 +904,9 @@ int wmain(int argc, wchar_t* argv[]) {
     Common::RegisterQuickExit();
     Common::HostException::InstallCrashNote();
     LeaveOutForeignVulkanLayers();
-    // (Before the options are read: nothing may map memory first.)
+    // (Before the options are read: nothing may map memory first. operator new may have, with
+    // mimalloc: its arenas are asked for at 2 TiB and above, outside the driver's room under
+    // 1 TiB and below the guest's extended memory at 8 TiB.)
     bool dlss = false;
     for (int index = 1; index + 1 < argc; index++) {
         dlss = dlss || ((wcscmp(argv[index], L"--upscaler") == 0 || wcscmp(argv[index], L"--pssr-upscaler") == 0) &&

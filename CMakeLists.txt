@@ -187,6 +187,19 @@ endif()
 
 option(KYTY_BUILD_LAUNCHER "Build Qt launcher" ON)
 
+# Windows: the emulator's operator new/delete from mimalloc (src/main.cpp; KYTY_MIMALLOC=0 at
+# run time keeps the CRT heap). Vendored: 3rdparty/mimalloc, v2.5.2, as the Demon's Souls fork
+# has it. (Linux: not built; preload libmimalloc.so instead.)
+if(WIN32)
+	set(kyty_mimalloc_default ON)
+else()
+	set(kyty_mimalloc_default OFF)
+endif()
+option(KYTY_MIMALLOC "Windows: operator new/delete from mimalloc (vendored, v2.5.2)" ${kyty_mimalloc_default})
+if(KYTY_MIMALLOC AND NOT WIN32)
+	message(FATAL_ERROR "KYTY_MIMALLOC is Windows-only (src/main.cpp); on Linux preload libmimalloc.so")
+endif()
+
 config_compiler_and_linker()
 
 add_subdirectory("${KYTY_THIRD_PARTY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty")
@@ -1302,6 +1315,12 @@ add_dependencies(kyty_emulator kyty_noto_sans_fonts)
 install(FILES ${KYTY_NOTO_SANS_FONTS} DESTINATION assets/fonts)
 
 target_link_libraries(kyty_emulator ${kyty_emulator_link_libraries})
+if(KYTY_MIMALLOC)
+	# main.cpp replaces operator new/delete for this executable only: the allocations of the
+	# drivers and of the other modules stay on the process heap.
+	target_link_libraries(kyty_emulator mimalloc-static)
+	set_property(SOURCE "${KYTY_SOURCE_DIR}/main.cpp" APPEND PROPERTY COMPILE_DEFINITIONS KYTY_MIMALLOC=1)
+endif()
 if (WIN32)
 	target_link_libraries(kyty_emulator opengl32)
 	target_link_libraries(kyty_emulator iphlpapi)
@@ -1387,6 +1406,9 @@ if(TARGET ooz_decode)
 	install(TARGETS ooz_decode DESTINATION .)
 	install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/tools/ooz-decode/README.md"
 		"${CMAKE_CURRENT_SOURCE_DIR}/LICENSES/GPL-3.0-or-later.txt" DESTINATION "licenses/ooz")
+endif()
+if(KYTY_MIMALLOC)
+	install(FILES "${KYTY_THIRD_PARTY_DIR}/mimalloc/LICENSE" DESTINATION "licenses/mimalloc")
 endif()
 if(KYTY_BUILD_LAUNCHER)
 	add_subdirectory("${KYTY_SOURCE_DIR}/launcher" "${CMAKE_CURRENT_BINARY_DIR}/launcher")
