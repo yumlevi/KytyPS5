@@ -168,6 +168,16 @@ inline constexpr uint64_t ClampReportLimit = 256;
 [[nodiscard]] uint64_t    ClampedRangeReports();
 // The mapped size from vaddr, at most size; 0 when vaddr itself is unmapped.
 [[nodiscard]] uint64_t MappedRangeSize(uint64_t vaddr, uint64_t size);
+// For telling whether the guest still touches a range (the buffer cache's hot set).
+// TrimGuestPages takes the range's pages out of the process's working set: they stay in memory
+// and come back at the next access through the guest's addresses (a soft fault no handler sees).
+// The emulator's own reads and writes of guest memory go through the backing's other view and do
+// not bring them back. GuestRangesTouched: for each range of `size` bytes at one of `starts`,
+// whether any page of it is back (one question to the system for all of them). Where the
+// system offers neither, nothing is trimmed and every range counts as touched.
+bool TrimGuestPages(uint64_t vaddr, uint64_t size);
+void GuestRangesTouched(std::span<const uint64_t> starts, uint64_t size,
+                        std::vector<uint8_t>& touched);
 // The guest mapping that holds `vaddr`, or the first one after it: [*start, *end). False when
 // there is none. (For host tools: the live channel's `mem`.)
 [[nodiscard]] bool     NextMappedRange(uint64_t vaddr, uint64_t* start, uint64_t* end);

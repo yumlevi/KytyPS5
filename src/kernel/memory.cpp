@@ -32,6 +32,7 @@
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
+#include <psapi.h>
 #ifndef MEM_RESERVE_PLACEHOLDER
 #define MEM_RESERVE_PLACEHOLDER 0x00040000
 #endif
@@ -2730,6 +2731,52 @@ bool TestGuestFreeRangeBounds() {
 	       !GuestFreeRangeContains(0x10000, 0x20000, 0x40000, 0x4000);
 }
 #endif
+
+bool TrimGuestPages(uint64_t vaddr, uint64_t size) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Unlocking pages that are not locked takes them out of the working set (the call then
+	// fails with ERROR_NOT_LOCKED, which is the success here).
+	return VirtualUnlock(reinterpret_cast<void*>(vaddr), size) != 0 ||
+	       GetLastError() == ERROR_NOT_LOCKED;
+#else
+	(void)vaddr;
+	(void)size;
+	return false;
+#endif
+}
+
+void GuestRangesTouched(std::span<const uint64_t> starts, uint64_t size,
+                        std::vector<uint8_t>& touched) {
+	touched.assign(starts.size(), 1);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	constexpr uint64_t HostPage = 0x1000;
+	const auto         each     = (size + HostPage - 1u) / HostPage;
+	if (starts.empty() || each == 0 || starts.size() * each > (uint64_t {1} << 20u)) {
+		return;
+	}
+	static thread_local std::vector<PSAPI_WORKING_SET_EX_INFORMATION> pages;
+	pages.assign(starts.size() * each, {});
+	for (size_t i = 0; i < starts.size(); ++i) {
+		for (uint64_t page = 0; page < each; ++page) {
+			pages[i * each + page].VirtualAddress =
+			    reinterpret_cast<void*>((starts[i] & ~(HostPage - 1u)) + page * HostPage);
+		}
+	}
+	if (QueryWorkingSetEx(GetCurrentProcess(), pages.data(),
+	                      static_cast<DWORD>(pages.size() * sizeof(pages[0]))) == 0) {
+		return;
+	}
+	for (size_t i = 0; i < starts.size(); ++i) {
+		bool valid = false;
+		for (uint64_t page = 0; page < each && !valid; ++page) {
+			valid = pages[i * each + page].VirtualAttributes.Valid != 0;
+		}
+		touched[i] = valid ? 1 : 0;
+	}
+#else
+	(void)size;
+#endif
+}
 
 bool NextMappedRange(uint64_t vaddr, uint64_t* start, uint64_t* end) {
 	VirtualRanges::Range candidate {};

@@ -20,6 +20,7 @@
 #include <array>
 #include <atomic>
 #include <map>
+#include <queue>
 #include <memory>
 #include <mutex>
 #include <semaphore>
@@ -375,6 +376,9 @@ private:
 		// Where the GPU thread leaves the end of the window it served (or handed over); null:
 		// nobody asks.
 		uint64_t* served_end = nullptr;
+		// A game thread asks (its own read or store, which goes through the guest's addresses),
+		// not the GPU thread for itself.
+		bool guest_thread = false;
 	};
 	void RequestGuestReadback(const GuestReadback& request);
 	// A guest thread: queues the request and returns once the GPU thread served it.
@@ -445,6 +449,19 @@ private:
 		// it was recorded at; 0 when none was recorded.
 		uint64_t download_tick  = 0;
 		uint64_t download_epoch = 0;
+		// ProbeHotPages: the collector tick at which the page, taken out of the working set, is
+		// asked whether it came back (0: not taken out yet), the askings in a row that found it
+		// untouched, and how often in a row it was found touched (it is then asked again after
+		// twice as long each time, up to eight times as long).
+		// `trimmed`: it has been taken out of the working set (not before it has been hot for a
+		// while).
+		// `guest_read`: only game threads' own reads and stores made it hot (the probe sees
+		// those; what the GPU thread reads for itself goes through the backing's other view).
+		uint64_t probe_due  = 0;
+		uint8_t  unread     = 0;
+		uint8_t  stretch    = 0;
+		bool     trimmed    = false;
+		bool     guest_read = false;
 	};
 	// The last window a guest read fault was served (ServeGuestReadbacks): its buffer, its end
 	// and its size.
@@ -452,9 +469,22 @@ private:
 	uint64_t m_read_run_end    = 0;
 	uint64_t m_read_run_window = 0;
 	// `most_pages`: the most pages from `vaddr` on that become hot (16 at least).
-	void                        TouchHotPages(uint64_t vaddr, uint64_t size, uint64_t most_pages = 0);
+	// `guest_read`: for a game thread's own read or store (ProbeHotPages).
+	void TouchHotPages(uint64_t vaddr, uint64_t size, uint64_t most_pages = 0,
+	                   bool guest_read = false);
 	// Drops the coldest eighth of the hot set; pages touched at `keep` stay.
 	void                        EvictColdHotPages(uint64_t keep);
+	// Drops the hot pages the game no longer reads (hot_probe): the pages that became hot since
+	// the last frame are taken out of the working set, the pages due are asked.
+	void                  ProbeHotPages();
+	std::vector<uint64_t> m_hot_probe_new;
+	std::vector<uint64_t> m_hot_probe_batch;
+	std::vector<uint64_t> m_hot_probe_due;
+	std::vector<uint8_t>  m_hot_probe_touched;
+	// (due tick, page), the earliest first; an entry whose page has another due tick is stale.
+	std::priority_queue<std::pair<uint64_t, uint64_t>, std::vector<std::pair<uint64_t, uint64_t>>,
+	                    std::greater<>>
+	    m_hot_probe_queue;
 	std::vector<uint64_t>       m_hot_eviction_scratch;
 	// A synchronous readback of a range whose GPU-dirty bytes all sit on hot pages with a
 	// submitted, still valid asynchronous download waits for those downloads to publish

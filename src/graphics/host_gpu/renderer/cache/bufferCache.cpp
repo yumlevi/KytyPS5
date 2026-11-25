@@ -81,6 +81,16 @@ Common::LiveControl::Switch g_readback_log("readback_log", 0);
 // fps, read-fault waits of the GPU thread 0.8 -> 0.0 a frame.
 Common::LiveControl::Switch g_hot_pages_max("hot_pages_max", 16384);
 Common::LiveControl::Switch g_hot_window("hot_window", 1);
+// The seconds (at 60 frames each) after which a hot page is asked again whether the game touched
+// it; untouched some askings in a row, it leaves the hot set (ProbeHotPages). 0: a page stays
+// hot for as long as the GPU writes it, as before.
+Common::LiveControl::Switch  g_hot_probe("hot_probe", 5);
+// The hot set's size (a measure line's per-frame figure is the number of pages), the pages a
+// frame took out of the working set, the pages that left the set unread, and the probe's time.
+Common::LiveControl::Counter g_hot_pages("hot_pages");
+Common::LiveControl::Counter g_hot_probe_trims("hot_probe_trims");
+Common::LiveControl::Counter g_hot_probe_evicted("hot_probe_evicted");
+Common::LiveControl::Counter g_hot_probe_us("hot_probe_us");
 // From this size on a buffer's creation and its release are logged with their times.
 constexpr uint64_t LargeBufferBytes = 64ull << 20u;
 
@@ -1062,7 +1072,10 @@ void BufferCache::RequestGuestReadback(const GuestReadback& request) {
 	    request.vaddr, request.size);
 	std::shared_ptr<GuestCopy> copy;
 	uint64_t                   served_end = 0;
-	QueueGuestReadback(request, g_guest_copy.On() ? &copy : nullptr,
+	// (A game thread's: see ProbeHotPages.)
+	auto asked         = request;
+	asked.guest_thread = true;
+	QueueGuestReadback(asked, g_guest_copy.On() ? &copy : nullptr,
 	                   request.ahead != 0 ? &served_end : nullptr);
 	if (served_end != 0) {
 		// A store's run goes on where the window it was given ends: that may be before the end
@@ -1116,7 +1129,7 @@ void BufferCache::RequestGuestReadback(const GuestReadback& request) {
 	}
 	if (again) {
 		g_guest_copy_again.Add();
-		auto whole  = request;
+		auto whole  = asked;
 		whole.ahead = 0;
 		QueueGuestReadback(whole, nullptr);
 	}
@@ -1203,7 +1216,7 @@ void BufferCache::ServeGuestReadbacks(std::span<const GuestReadback> requests) {
 				}
 			});
 		}
-		TouchHotPages(result.base, result.size);
+		TouchHotPages(result.base, result.size, 0, request.guest_thread);
 		DrainPublished();
 		const auto buffer_id = FindBuffer(result.base, result.size);
 		auto&      buffer    = m_slot_buffers[buffer_id];
@@ -1287,7 +1300,8 @@ void BufferCache::ServeGuestReadbacks(std::span<const GuestReadback> requests) {
 			result.base = start;
 			result.size = end - start;
 			if (request.kind == GuestReadback::Kind::Around && g_hot_window.On()) {
-				TouchHotPages(result.base, result.size, result.size / CACHING_PAGESIZE);
+				TouchHotPages(result.base, result.size, result.size / CACHING_PAGESIZE,
+				              request.guest_thread);
 			}
 		}
 		if (request.kind == GuestReadback::Kind::Around && request.handoff != nullptr &&
@@ -1568,7 +1582,8 @@ void BufferCache::ValidateDirtyRun(uint64_t address, uint64_t bytes, const char*
 // costs O(1) amortized instead of a scan of the whole set.
 static constexpr uint64_t MaxHotTouchPages = 16;
 
-void BufferCache::TouchHotPages(uint64_t vaddr, uint64_t size, uint64_t most_pages) {
+void BufferCache::TouchHotPages(uint64_t vaddr, uint64_t size, uint64_t most_pages,
+                                bool guest_read) {
 	const auto first = vaddr & ~(CACHING_PAGESIZE - 1u);
 	const auto last  = std::min(Common::AlignUp(vaddr + size, CACHING_PAGESIZE),
 	                            first + std::max(most_pages, MaxHotTouchPages) * CACHING_PAGESIZE);
@@ -1577,14 +1592,21 @@ void BufferCache::TouchHotPages(uint64_t vaddr, uint64_t size, uint64_t most_pag
 		if (auto it = m_hot_pages.find(page); it != m_hot_pages.end()) {
 			it->second.touched = touch;
 			it->second.faulted = touch;
+			// (Read again; and by a reader the probe cannot see, it is no longer the probe's.)
+			it->second.unread = 0;
+			it->second.guest_read &= guest_read;
 			continue;
 		}
 		if (m_hot_pages.size() >= std::max<size_t>(g_hot_pages_max.Get(), 64)) {
 			EvictColdHotPages(touch);
 		}
-		m_hot_pages.emplace(page, HotPage {.touched = touch,
-		                                   .faulted = touch,
-		                                   .epoch   = std::make_shared<std::atomic<uint64_t>>(0)});
+		m_hot_pages.emplace(page, HotPage {.touched    = touch,
+		                                   .faulted    = touch,
+		                                   .epoch      = std::make_shared<std::atomic<uint64_t>>(0),
+		                                   .guest_read = guest_read});
+		if (guest_read) {
+			m_hot_probe_new.push_back(page);
+		}
 	}
 }
 
@@ -1614,6 +1636,133 @@ void BufferCache::EvictColdHotPages(uint64_t keep) {
 		}
 		return true;
 	});
+}
+
+// A page became hot at a guest read and stayed hot for as long as the GPU wrote it: served ahead,
+// it never faults again, so nothing said whether the game still read it. Every frame its bytes
+// were downloaded and published and its protection changed twice. Unreal's transient memory is
+// written by the GPU in every frame, so one read of a page of it was enough for good: after 90
+// seconds of play in Saros 15,000 pages were hot and 2,600 of them were brought back a frame, of
+// which the game read 350; in a session of 25 minutes it was 4,000 a frame. Emptying the set once
+// (a test) took that scene from 50.7 to 56.0 fps, where it stayed.
+//
+// Windows knows whether a page was touched: a page taken out of the process's working set
+// (LibKernel::Memory::TrimGuestPages) stays in memory and comes back at its next access through
+// the guest's addresses, a soft fault of a microsecond that no handler of ours sees, and
+// GuestRangesTouched says whether it is back. The emulator's own reads and writes of guest
+// memory go through the backing's other view and do not count: a page the GPU thread asked for
+// by itself (a label's store, the bytes of a put-off dispatch) is left alone. So a page that a
+// game thread's own read or store made hot, and that has been hot for
+// two seconds is taken out (while the game moves, most pages of the read windows have left the
+// full set by then, and are never looked at), and asked hot_probe seconds later: untouched
+// three times in a row, it leaves the hot set as an evicted page does (after two, the pages the
+// game reads every ten to fifteen seconds left and faulted back in turn). Found touched, it is
+// taken out again and asked after twice as long each time, up to eight times: every asking
+// costs the game a soft fault for each 4 KiB of the page. A page that left and is read again
+// after all faults once and is hot again. The work is done every eighth frame, the pages that
+// lie side by side with one call.
+void BufferCache::ProbeHotPages() {
+	g_hot_pages.Add(m_hot_pages.size());
+	const auto         seconds = g_hot_probe.Get();
+	const uint64_t     now     = m_gc_tick + 1u;
+	constexpr uint64_t Period  = 8;
+	if (seconds == 0) {
+		m_hot_probe_new.clear();
+		return;
+	}
+	if (now % Period != 0 ||
+	    (m_hot_probe_new.empty() &&
+	     (m_hot_probe_queue.empty() || m_hot_probe_queue.top().first > now))) {
+		return;
+	}
+	const auto         begin       = std::chrono::steady_clock::now();
+	const uint64_t     window      = uint64_t {seconds} * 60u;
+	constexpr uint64_t FirstWindow = 2u * 60u;
+	constexpr size_t   MaxNew      = 8192;
+	constexpr size_t   MaxAsked    = 2048;
+	constexpr uint8_t  MaxUnread   = 3;
+	auto&              trim        = m_hot_probe_batch;
+	trim.clear();
+	// The pages that became hot since the last time: looked at again when they have stayed.
+	for (size_t taken = 0; taken < MaxNew && !m_hot_probe_new.empty(); ++taken) {
+		const auto page = m_hot_probe_new.back();
+		m_hot_probe_new.pop_back();
+		if (const auto it = m_hot_pages.find(page);
+		    it != m_hot_pages.end() && it->second.probe_due == 0) {
+			it->second.probe_due = now + FirstWindow;
+			m_hot_probe_queue.emplace(it->second.probe_due, page);
+		}
+	}
+	// The pages due: taken out for the first time, or asked, together.
+	auto& due_pages = m_hot_probe_due;
+	due_pages.clear();
+	while (due_pages.size() < MaxAsked && !m_hot_probe_queue.empty() &&
+	       m_hot_probe_queue.top().first <= now) {
+		const auto [due, page] = m_hot_probe_queue.top();
+		m_hot_probe_queue.pop();
+		const auto it = m_hot_pages.find(page);
+		if (it == m_hot_pages.end() || it->second.probe_due != due || !it->second.guest_read) {
+			continue; // Evicted since, hot anew, or asked for by a reader of the emulator's own.
+		}
+		if (!it->second.trimmed) {
+			it->second.trimmed   = true;
+			it->second.probe_due = now + window;
+			m_hot_probe_queue.emplace(it->second.probe_due, page);
+			trim.push_back(page);
+			continue;
+		}
+		// (Marked: an entry of the same page and tick further on is not taken a second time.)
+		it->second.probe_due = 0;
+		due_pages.push_back(page);
+	}
+	LibKernel::Memory::GuestRangesTouched(due_pages, CACHING_PAGESIZE, m_hot_probe_touched);
+	for (size_t i = 0; i < due_pages.size(); ++i) {
+		const auto page = due_pages[i];
+		const auto it   = m_hot_pages.find(page);
+		auto&      hot  = it->second;
+		if (m_hot_probe_touched[i] != 0) {
+			hot.unread  = 0;
+			hot.stretch = static_cast<uint8_t>(std::min(hot.stretch + 1, 3));
+			trim.push_back(page);
+		} else {
+			// (Still out of the working set: not taken out again.)
+			hot.stretch = 0;
+			if (++hot.unread >= MaxUnread) {
+				// As EvictColdHotPages lets a page go: a download on its way is not published,
+				// and a page readable with a write pending faults from here on.
+				hot.epoch->fetch_add(1, std::memory_order_acq_rel);
+				if (m_memory_tracker.IsGpuModifiedReadable(page, CACHING_PAGESIZE)) {
+					m_memory_tracker.SetGpuModifiedReadable(page, CACHING_PAGESIZE, false);
+				}
+				g_hot_probe_evicted.Add();
+				m_hot_pages.erase(it);
+				continue;
+			}
+		}
+		hot.probe_due = now + (window << hot.stretch);
+		m_hot_probe_queue.emplace(hot.probe_due, page);
+	}
+	// Out of the working set, in runs of adjacent pages (a run over two mappings is refused
+	// whole: page by page then).
+	std::ranges::sort(trim);
+	trim.erase(std::unique(trim.begin(), trim.end()), trim.end());
+	for (size_t i = 0; i < trim.size();) {
+		size_t end = i + 1;
+		while (end < trim.size() && trim[end] == trim[end - 1] + CACHING_PAGESIZE) {
+			++end;
+		}
+		if (!LibKernel::Memory::TrimGuestPages(trim[i], (end - i) * CACHING_PAGESIZE)) {
+			for (size_t page = i; page < end; ++page) {
+				(void)LibKernel::Memory::TrimGuestPages(trim[page], CACHING_PAGESIZE);
+			}
+		}
+		i = end;
+	}
+	g_hot_probe_trims.Add(trim.size());
+	g_hot_probe_us.Add(static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+	                                                          begin)
+	        .count()));
 }
 
 void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size) {
@@ -2895,6 +3044,7 @@ void BufferCache::RunGarbageCollector() {
 	RetireBdaTables();
 	ProbeBdaReaders();
 	KeepAccessedBdaBuffers();
+	ProbeHotPages();
 	const auto tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		UpdateGcMarks();
