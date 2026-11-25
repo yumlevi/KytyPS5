@@ -141,6 +141,9 @@ public:
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasOnlyGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// Advances whenever a publication (the completion thread's, a guest thread's copy) was taken
+	// off the GPU-dirty bytes: a reader that kept bytes read before it reads them again.
+	[[nodiscard]] uint64_t PublishSequence() const noexcept { return m_publish_sequence; }
 	// (GPU thread.) The GPU-written bytes of the ranges are brought to guest memory without a
 	// wait: their pages join the hot set, at its front, and are downloaded with the next
 	// submission unless a download of their latest write is on its way. A caller that reads the
@@ -488,6 +491,8 @@ private:
 		uint64_t size;
 	};
 	std::mutex             m_published_mutex;
+	// Drains that took something off the GPU-dirty bytes (PublishSequence; GPU thread).
+	uint64_t               m_publish_sequence = 0;
 	std::vector<Published> m_published;
 	// DrainPublished's scratch (GPU thread).
 	std::vector<Published> m_published_drained;

@@ -25,6 +25,7 @@ public:
 	static bool     HasGpuDirtyBytes(uint64_t /*address*/, uint64_t /*size*/) { return false; }
 	static void     ReadGpuDirtyBytes(std::span<const ScalarReadRange> /*ranges*/) {}
 	static uint64_t GpuWriteSequence() { return 0; }
+	static uint64_t PublishSequence() { return 0; }
 
 	// The specialization reader: the same bytes the owner's buffer-backing reader returns when
 	// the range holds no GPU-dirty bytes, which the owner checks.

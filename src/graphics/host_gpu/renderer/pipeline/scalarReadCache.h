@@ -34,6 +34,12 @@ namespace Libs::Graphics {
 //   bool     HasGpuDirtyBytes(uint64_t address, uint64_t size);
 //   void     ReadGpuDirtyBytes(std::span<const ScalarReadRange> ranges); // one readback of all
 //   uint64_t GpuWriteSequence();                                  // advances per recorded write
+//   uint64_t PublishSequence();   // advances when GPU-written bytes reached the backing without
+//                                 // a readback of this cache (an asynchronous download landed)
+//
+// A chunk that held GPU-dirty bytes when it was filled holds their old values. Its clean bytes
+// are served from it; a byte that is no longer GPU-dirty when it is asked for was published
+// since, so the chunk is filled again first (PublishSequence tells whether anything was).
 using ScalarReadRange = std::pair<uint64_t, uint64_t>; // address, size
 
 template <typename Backend>
@@ -79,6 +85,9 @@ public:
 				if (entry.dirty && m_backend.HasGpuDirtyBytes(address, sizeof(uint32_t))) {
 					return false;
 				}
+				Refill(entry, base);
+			}
+			if (entry.base == base) {
 				std::memcpy(&value, reinterpret_cast<const uint8_t*>(entry.words) + (address - base),
 				            sizeof(uint32_t));
 				return true;
@@ -107,9 +116,13 @@ public:
 			if (entry.base != base) {
 				Fill(entry, base);
 			}
-			if (entry.base == base && entry.dirty && m_backend.HasGpuDirtyBytes(address, bytes)) {
-				ReadBack(address, bytes);
-				Fill(entry, base);
+			if (entry.base == base && entry.dirty) {
+				if (m_backend.HasGpuDirtyBytes(address, bytes)) {
+					ReadBack(address, bytes);
+					Fill(entry, base);
+				} else {
+					Refill(entry, base);
+				}
 			}
 			if (entry.base == base) {
 				std::memcpy(values.data(),
@@ -148,15 +161,31 @@ private:
 	struct Entry {
 		uint64_t base  = UINT64_MAX;
 		bool     dirty = false;
+		// PublishSequence when it was filled (a dirty one's bytes may be older than the backing).
+		uint64_t published = 0;
 		uint32_t words[ChunkBytes / sizeof(uint32_t)];
 	};
 
 	static size_t Index(uint64_t base) { return (base / ChunkBytes) % Entries; }
 
+	// The question comes before the read: bytes that are clean then are read as they are, and a
+	// publication that lands between the two only makes the chunk's bytes newer than its mark
+	// says. (Read first, a chunk filled just before a publication was marked clean with the
+	// bytes of before it.)
 	void Fill(Entry& entry, uint64_t base) {
-		entry.base  = m_backend.Read(base, entry.words, ChunkBytes) ? base : UINT64_MAX;
-		entry.dirty = entry.base == base && m_backend.HasGpuDirtyBytes(base, ChunkBytes);
+		const bool dirty = m_backend.HasGpuDirtyBytes(base, ChunkBytes);
+		entry.published  = m_backend.PublishSequence();
+		entry.base       = m_backend.Read(base, entry.words, ChunkBytes) ? base : UINT64_MAX;
+		entry.dirty      = entry.base == base && dirty;
 		m_tags[Index(base)] = entry.dirty ? UINT64_MAX : entry.base;
+	}
+
+	// For a chunk marked dirty whose asked bytes are not GPU-dirty now: they were clean when it
+	// was filled, or were published since. In the second case the chunk holds their old values.
+	void Refill(Entry& entry, uint64_t base) {
+		if (entry.dirty && m_backend.PublishSequence() != entry.published) {
+			Fill(entry, base);
+		}
 	}
 
 	// A readback also publishes completed asynchronous downloads, which turns GPU-dirty bytes

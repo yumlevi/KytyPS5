@@ -233,6 +233,7 @@ struct GuestScalarMemory {
 		Libs::LibKernel::Memory::ReadGpuDirtyBytes(ranges);
 	}
 	static uint64_t GpuWriteSequence() { return Libs::LibKernel::Memory::GpuWriteSequence(); }
+	static uint64_t PublishSequence() { return Libs::LibKernel::Memory::GpuPublishSequence(); }
 };
 using GuestScalarReadCache = ScalarReadCache<GuestScalarMemory>;
 

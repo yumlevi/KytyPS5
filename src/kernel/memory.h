@@ -152,6 +152,9 @@ bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t
 // Reads back the GPU-dirty bytes of several (address, size) ranges with one wait for the GPU.
 void                   ReadGpuDirtyBytes(std::span<const std::pair<uint64_t, uint64_t>> ranges);
 [[nodiscard]] uint64_t GpuWriteSequence();
+// Advances when GPU-written bytes reached guest memory by a publication the GPU thread took
+// note of (BufferCache::DrainPublished); 0 off the GPU thread.
+[[nodiscard]] uint64_t GpuPublishSequence();
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
 // On the GPU thread, before it writes guest memory for a command: waits until the end-of-pipe

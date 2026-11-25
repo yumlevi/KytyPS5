@@ -1733,6 +1733,9 @@ void BufferCache::DrainPublished() {
 		published.swap(m_published);
 		m_published_pending.store(false, std::memory_order_release);
 	}
+	if (!published.empty()) {
+		++m_publish_sequence;
+	}
 	// A published tracker page that is still clean holds no GPU write recorded since the
 	// download (recording one marks the page first), so all its dirty intervals were published.
 	// One that is dirty again keeps them: the download that cleans it takes the whole page. The

@@ -98,6 +98,23 @@ struct FakeGuestMemory {
     downloaded.clear();
   }
   uint64_t GpuWriteSequence() const { return sequence; }
+  // An asynchronous publication of GPU-written bytes: they reach the backing and
+  // stop being dirty with no readback asked for.
+  uint64_t publish_sequence = 0;
+  uint64_t PublishSequence() const { return publish_sequence; }
+  void Publish(uint64_t address, uint64_t size) {
+    std::vector<std::pair<uint64_t, uint64_t>> remaining;
+    for (const auto &[start, bytes] : dirty) {
+      if (!Overlaps(start, bytes, address, size)) {
+        remaining.emplace_back(start, bytes);
+        continue;
+      }
+      std::memcpy(backing.data() + (start - Base), gpu.data() + (start - Base),
+                  bytes);
+    }
+    dirty = std::move(remaining);
+    ++publish_sequence;
+  }
 };
 
 using Cache = Libs::Graphics::ScalarReadCache<FakeGuestMemory>;
@@ -277,6 +294,33 @@ void TestWalkReadBacksShareOneWait() {
   }
 }
 
+// A publication that lands while a walk holds a chunk filled before it: the
+// chunk's copy of the published word is the old one, and the word reads as
+// clean. It is read again, without a readback; the chunk's other words too.
+void TestPublicationAfterFill() {
+  FakeGuestMemory memory;
+  const auto chunk = FakeGuestMemory::Base + 0x480;
+  memory.CpuWrite(chunk + 0x10, 1);
+  memory.CpuWrite(chunk + 0x20, 5);
+  memory.GpuWrite(chunk + 0x20, 6);
+  memory.CpuWrite(chunk + 0x30, 7);
+  memory.GpuWrite(chunk + 0x30, 8);
+  Cache cache(memory);
+  Check(ReadWord(cache, chunk + 0x10) == 1, "a clean word of a dirty chunk");
+  memory.Publish(chunk + 0x20, 4);
+  Check(ReadWord(cache, chunk + 0x20) == 6 && memory.readbacks.empty(),
+        "a word published after its chunk was filled read the value of before");
+  // The data reader's form of the same read, on the word still with the GPU and
+  // then after its publication.
+  uint32_t value = 0;
+  Check(!cache.ReadUnlessGpuDirty(chunk + 0x30, value) && value == 0,
+        "a word the GPU still holds was not refused");
+  memory.Publish(chunk + 0x30, 4);
+  Check(cache.ReadUnlessGpuDirty(chunk + 0x30, value) && value == 8 &&
+            memory.readbacks.empty(),
+        "the data reader took a published word from the chunk of before");
+}
+
 void TestUncachedAndUnmappedReads() {
   FakeGuestMemory memory;
   // A read that ends past the mapping falls back to an exact read and returns
@@ -340,6 +384,7 @@ int main() {
   TestCachedChunkDroppedAfterGpuWrite();
   TestPublishedWordOfCachedChunk();
   TestWalkReadBacksShareOneWait();
+  TestPublicationAfterFill();
   TestUncachedAndUnmappedReads();
   TestTagsServeOnlyCleanChunks();
   std::printf("ScalarReadCacheTests: ok\n");
