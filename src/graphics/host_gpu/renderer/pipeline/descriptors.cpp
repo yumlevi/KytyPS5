@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/liveControl.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -1273,6 +1274,20 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	}
 }
 
+// What the bindless image table gives the shaders, a frame (measure lines): keys resolved to an
+// image, keys that got the placeholder because their T# is of another kind than the heap's
+// first user declared (dimension, numeric class) or for another reason, and uses of a heap by a
+// shader whose image is of another kind than the one the heap was made for. bindless_log 1
+// lists them (the first 96 of each).
+namespace {
+Common::LiveControl::Counter g_bindless_resolved("bindless_resolved");
+Common::LiveControl::Counter g_bindless_refused_dimension("bindless_refused_dimension");
+Common::LiveControl::Counter g_bindless_refused_class("bindless_refused_class");
+Common::LiveControl::Counter g_bindless_refused_other("bindless_refused_other");
+Common::LiveControl::Counter g_bindless_other_kind("bindless_other_kind");
+Common::LiveControl::Switch  g_bindless_log("bindless_log", 0);
+} // namespace
+
 // A heap is the records of one V# a stage reaches T#s through (ResourceSnapshot::BindlessUse);
 // its region and entry count go into the stage's copy of the flattened SRT.
 void RenderExecutor::PrepareBindlessHeaps(PreparedBindings& prepared) {
@@ -1286,6 +1301,30 @@ void RenderExecutor::PrepareBindlessHeaps(PreparedBindings& prepared) {
 	auto& translation = table.Translation();
 	EnsureBindlessPlaceholder();
 	prepared.bindless_srt.assign(snapshot.flattened_srt.begin(), snapshot.flattened_srt.end());
+	if (g_bindless_log.On()) {
+		// Once per program: its bindless uses and the images they go through.
+		static std::vector<uint64_t> listed;
+		if (listed.size() < 64u && std::ranges::find(listed, program.shader_hash) == listed.end()) {
+			listed.push_back(program.shader_hash);
+			for (const auto& use: snapshot.bindless_uses) {
+				const auto& image = program.info.images[use.resource];
+				LOGF("Bindless use: shader %016" PRIx64 " stage %u image %u of %zu: base 0x%" PRIx64
+				     " stride %u pointer %u table +%u layers %u x %u; dimension %u numeric %u class "
+				     "%u read %d written %d unfiltered %d raw-class %d depth-compare %d mips %u "
+				     "swizzle 0x%x conversion %u\n",
+				     program.shader_hash, static_cast<uint32_t>(program.stage), use.resource,
+				     program.info.images.size(), use.base, use.record_stride, use.pointer_offset,
+				     use.table_offset, use.layer_count, use.layer_stride,
+				     static_cast<uint32_t>(image.dimension),
+				     static_cast<uint32_t>(image.numeric_class),
+				     static_cast<uint32_t>(image.resource_class), image.read ? 1 : 0,
+				     image.written ? 1 : 0, image.unfiltered_access_only ? 1 : 0,
+				     ShaderRecompiler::IR::RawClassImage(image) ? 1 : 0, image.depth_compare ? 1 : 0,
+				     image.mip_count, image.shader_swizzle,
+				     static_cast<uint32_t>(image.conversion_format));
+			}
+		}
+	}
 	for (const auto& use: snapshot.bindless_uses) {
 		EXIT_IF(use.layer_count == 0 || use.mapping_offset + 1u >= prepared.bindless_srt.size());
 		auto* words = prepared.bindless_srt.data() + use.mapping_offset;
@@ -1314,6 +1353,41 @@ void RenderExecutor::PrepareBindlessHeaps(PreparedBindings& prepared) {
 			m_bindless_resources.resize(heap + 1u);
 			m_bindless_resources[heap] = program.info.images[use.resource];
 			FillBindlessHeap(heap);
+			static uint32_t reported = 0;
+			if (g_bindless_log.On() && reported++ < 96u) {
+				const auto& made = m_bindless_resources[heap];
+				LOGF("Bindless heap %u: base 0x%" PRIx64 " stride %u pointer %u table +%u layers "
+				     "%u x %u, made for shader %016" PRIx64 " stage %u image dimension %u numeric "
+				     "%u class %u cube %d\n",
+				     heap, use.base, use.record_stride, use.pointer_offset, use.table_offset,
+				     use.layer_count, use.layer_stride, program.shader_hash,
+				     static_cast<uint32_t>(program.stage), static_cast<uint32_t>(made.dimension),
+				     static_cast<uint32_t>(made.numeric_class),
+				     static_cast<uint32_t>(made.resource_class), made.cube ? 1 : 0);
+			}
+		} else {
+			// The heap takes the T#s its first user's image can bind (ResolveBindlessKey): a
+			// shader that reaches the same records with an image of another kind gets the
+			// placeholder for its own.
+			const auto& made = m_bindless_resources[heap];
+			const auto& now  = program.info.images[use.resource];
+			if (made.dimension != now.dimension || made.numeric_class != now.numeric_class ||
+			    made.resource_class != now.resource_class || made.cube != now.cube) {
+				g_bindless_other_kind.Add();
+				static uint32_t reported = 0;
+				if (g_bindless_log.On() && reported++ < 96u) {
+					LOGF("Bindless heap %u (base 0x%" PRIx64 " table +%u), made for dimension %u "
+					     "numeric %u class %u cube %d, is used by shader %016" PRIx64 " stage %u "
+					     "with dimension %u numeric %u class %u cube %d\n",
+					     heap, use.base, use.table_offset, static_cast<uint32_t>(made.dimension),
+					     static_cast<uint32_t>(made.numeric_class),
+					     static_cast<uint32_t>(made.resource_class), made.cube ? 1 : 0,
+					     program.shader_hash, static_cast<uint32_t>(program.stage),
+					     static_cast<uint32_t>(now.dimension),
+					     static_cast<uint32_t>(now.numeric_class),
+					     static_cast<uint32_t>(now.resource_class), now.cube ? 1 : 0);
+				}
+			}
 		}
 		const auto& found = translation.GetHeap(heap);
 		words[0]          = found.region;
@@ -1428,15 +1502,34 @@ uint32_t RenderExecutor::ResolveBindlessKey(uint32_t                            
 	auto& cache   = m_context.GetTextureCache();
 	auto  binding = ResolveTexture(m_bindless_resources[heap], value, TextureSource::Optional);
 	if (!binding.image_id) {
+		// Why (the checks of ResolveTexture an optional source can fail, in its order).
+		const auto& made   = m_bindless_resources[heap];
+		const bool  fits   = TextureTypeFitsDimension(type, made.dimension);
+		const auto  format = tsharp.Format();
+		const bool  same_class =
+		    made.numeric_class ==
+		    Prospero::SampledTextureNumericClass(Prospero::RemapTextureFormat(format));
+		(!fits ? g_bindless_refused_dimension : !same_class ? g_bindless_refused_class
+		                                                     : g_bindless_refused_other)
+		    .Add();
 		static uint32_t reported = 0;
-		if (reported++ < 8u) {
+		if (reported++ < (g_bindless_log.On() ? 96u : 8u)) {
 			LOGF("bindless key names a T# that cannot be bound: %08x %08x %08x %08x %08x %08x "
-			     "%08x %08x\n",
+			     "%08x %08x (heap %u record %u layer %u: a %ux%ux%u image of type %u format %u; "
+			     "the heap's image has dimension %u numeric %u class %u: %s)\n",
 			     value.dwords[0], value.dwords[1], value.dwords[2], value.dwords[3],
-			     value.dwords[4], value.dwords[5], value.dwords[6], value.dwords[7]);
+			     value.dwords[4], value.dwords[5], value.dwords[6], value.dwords[7], heap,
+			     request.record, request.layer, static_cast<uint32_t>(tsharp.Width5()) + 1u,
+			     static_cast<uint32_t>(tsharp.Height5()) + 1u,
+			     static_cast<uint32_t>(tsharp.Depth()) + 1u, static_cast<uint32_t>(type),
+			     static_cast<uint32_t>(format), static_cast<uint32_t>(made.dimension),
+			     static_cast<uint32_t>(made.numeric_class),
+			     static_cast<uint32_t>(made.resource_class),
+			     !fits ? "another dimension" : !same_class ? "another numeric class" : "other");
 		}
 		return BindlessTranslation::PlaceholderSlot;
 	}
+	g_bindless_resolved.Add();
 	auto& image = cache.GetImage(binding.image_id);
 	if (image.info.IsDepth() || image.info.data.Empty()) {
 		return BindlessTranslation::PlaceholderSlot;
