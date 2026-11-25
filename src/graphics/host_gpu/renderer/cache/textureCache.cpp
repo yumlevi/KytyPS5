@@ -31,7 +31,9 @@
 #include <span>
 #include <string_view>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
+#include <vector>
 #include <vulkan/vulkan_format_traits.hpp>
 
 namespace Libs::Graphics {
@@ -1134,9 +1136,93 @@ bool TextureCache::CanDownload(const Image& image) const {
 	       info.LinearSize() != 0;
 }
 
+// upload_log 1: every image upload is counted by image (its memory, size and format) until the
+// switch goes back to 0; the images that uploaded the most are then listed in the log, with how
+// often they did and after what: a GPU buffer write over the image's memory, a write of the
+// game's own, or as another image than the one before at that place. For telling what a
+// frame's texture uploads are (texture_upload_kb).
+namespace {
+Common::LiveControl::Switch g_upload_log("upload_log", 0);
+struct UploadNote {
+	uint64_t     address = 0;
+	uint64_t     size    = 0;
+	vk::Extent3D extent {};
+	uint32_t     levels             = 0;
+	uint32_t     layers             = 0;
+	uint32_t     format             = 0;
+	uint32_t     binding            = 0;
+	uint64_t     serial             = 0;
+	uint32_t     uploads            = 0;
+	uint32_t     after_buffer_write = 0;
+	uint32_t     after_game_write   = 0;
+	uint32_t     images             = 0;
+	uint64_t     bytes              = 0;
+};
+std::mutex                               g_upload_notes_mutex;
+std::unordered_map<uint64_t, UploadNote> g_upload_notes;
+uint64_t                                 g_upload_log_frames = 0;
+
+void NoteUpload(Image& image, uint32_t binding) {
+	const auto&            info = image.info;
+	const std::scoped_lock lock {g_upload_notes_mutex};
+	auto& note = g_upload_notes[info.data.address ^ (info.data.size << 40u) ^
+	                            (uint64_t {static_cast<uint32_t>(info.guest_format)} << 56u)];
+	note.address = info.data.address;
+	note.size    = info.data.size;
+	note.extent  = info.extent;
+	note.levels  = info.resources.levels;
+	note.layers  = info.resources.layers;
+	note.format  = static_cast<uint32_t>(info.guest_format);
+	note.binding = binding;
+	if (note.uploads == 0 || note.serial != image.serial) {
+		++note.images;
+	}
+	note.serial = image.serial;
+	++note.uploads;
+	note.bytes += info.data.size;
+	if (image.IsBufferModified()) {
+		++note.after_buffer_write;
+	} else if (image.IsCpuDirty()) {
+		++note.after_game_write;
+	}
+}
+
+void FlushUploadLog() {
+	const std::scoped_lock  lock {g_upload_notes_mutex};
+	std::vector<UploadNote> notes;
+	uint64_t                bytes = 0;
+	for (const auto& [key, note]: g_upload_notes) {
+		notes.push_back(note);
+		bytes += note.bytes;
+	}
+	std::ranges::sort(notes, std::ranges::greater {}, &UploadNote::bytes);
+	const auto frames = std::max<uint64_t>(g_upload_log_frames, 1);
+	LOGF("Upload log: %zu images uploaded %" PRIu64 " KiB in %" PRIu64 " frames (%" PRIu64
+	     " KiB a frame); the largest:\n",
+	     notes.size(), bytes / 1024u, g_upload_log_frames, bytes / 1024u / frames);
+	for (size_t i = 0; i < notes.size() && i < 40u; ++i) {
+		const auto& note = notes[i];
+		LOGF("Upload log: 0x%010" PRIx64 " %7" PRIu64 " KiB %ux%ux%u levels %u layers %u format %u "
+		     "binding %u: %u uploads (%.2f a frame), %" PRIu64 " KiB a frame; %u after a GPU "
+		     "buffer write, %u after a write of the game, %u images at that place\n",
+		     note.address, note.size / 1024u, note.extent.width, note.extent.height,
+		     note.extent.depth, note.levels, note.layers, note.format, note.binding, note.uploads,
+		     static_cast<double>(note.uploads) / static_cast<double>(frames),
+		     note.bytes / 1024u / frames, note.after_buffer_write, note.after_game_write,
+		     note.images);
+	}
+	g_upload_notes.clear();
+	g_upload_log_frames = 0;
+}
+} // namespace
+
 void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
 	const CommandBuffer::ProfileGuard profile(m_scheduler.Current(),
 	                                          CommandBuffer::ProfileScope::TextureUploads);
+	if (g_upload_log.On()) {
+		NoteUpload(image, static_cast<uint32_t>(image.depth_id ? BindingType::DepthTarget
+		                                                          : UploadBinding(image)));
+	}
 	auto& destination = image.depth_id ? m_slot_images[image.depth_id] : image;
 	const auto& info        = image.info;
 	const auto  binding     = image.depth_id ? BindingType::DepthTarget : UploadBinding(image);
@@ -2821,6 +2907,12 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
+	// (upload_log: a frame of the list, or the list when the switch went off.)
+	if (g_upload_log.On()) {
+		++g_upload_log_frames;
+	} else if (g_upload_log_frames != 0) {
+		FlushUploadLog();
+	}
 	if (m_graphics.CanReportMemoryUsage()) {
 		UpdateGcMarks();
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
