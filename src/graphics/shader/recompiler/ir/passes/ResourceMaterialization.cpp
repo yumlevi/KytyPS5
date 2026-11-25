@@ -4150,10 +4150,12 @@ std::vector<uint8_t> SaveResourcePlan(const ResourcePlan& plan) {
 	return std::move(writer.bytes);
 }
 
-bool LoadResourcePlan(std::span<const uint8_t> bytes, ResourcePlan& plan) {
+bool LoadResourcePlan(std::span<const uint8_t> bytes, ResourcePlan& plan, SrtWalkerLoads loads,
+                      SrtWalkerCompilation compilation) {
 	Reader reader {bytes};
 	IoPlan(reader, plan);
-	return reader.ok && reader.bytes.empty() && DerivePlanState(plan);
+	return reader.ok && reader.bytes.empty() &&
+	       DerivePlanState(plan, loads, compilation == SrtWalkerCompilation::Now);
 }
 
 static void FillBufferFormats(const ShaderInfo& info, const Bindings& bindings,

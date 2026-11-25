@@ -180,6 +180,11 @@ bool ModuleStore::Find(const Key& key, std::vector<uint32_t>& words, std::vector
 	return true;
 }
 
+bool ModuleStore::Contains(const Key& key) const {
+	std::lock_guard lock(m_mutex);
+	return m_entries.contains(key);
+}
+
 void ModuleStore::Insert(const Key& key, std::span<const uint32_t> words,
                          std::span<const uint8_t> info) {
 	if (words.empty() || words.size() > MaxWords || info.size() > MaxInfoBytes) {

@@ -344,6 +344,9 @@ private:
 	// Compiled modules kept across sessions (ModuleStore, storedModules.h); destroyed after the
 	// program cache as well.
 	std::unique_ptr<ModuleStore>                              m_module_store;
+	// What a translation gives besides its modules, kept the same way (storedModules.h: the
+	// plan store); destroyed after the program cache too.
+	std::unique_ptr<ModuleStore>                              m_plan_store;
 	std::unique_ptr<ProgramCache>                             m_program_cache;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;

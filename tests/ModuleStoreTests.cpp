@@ -69,8 +69,10 @@ void TestAcrossSessions() {
     std::vector<uint32_t> words;
     std::vector<uint8_t> info;
     Check(!store.Find(key_a, words, info), "nothing is found in a new store");
+    Check(!store.Contains(key_a), "a new store contains nothing");
     const auto empty = store.GetCounts().file_bytes;
     store.Insert(key_a, words_a, info_a);
+    Check(store.Contains(key_a) && !store.Contains(key_b), "a key is contained once inserted");
     // Before the writer has run: served from memory.
     Check(store.Find(key_a, words, info) && words == words_a && info == info_a,
           "a module is found right after its insertion");
@@ -99,6 +101,8 @@ void TestAcrossSessions() {
     Check(store.Find(key_b, words, info) && words == words_b && info.empty(),
           "the second module in the next session");
     Check(!store.Find(key_c, words, info), "an unknown key");
+    Check(store.Contains(key_a) && store.Contains(key_b) && !store.Contains(key_c),
+          "the next session contains what the file lists");
     store.Insert(key_c, Words(1000, 3), Bytes(10, 3));
   }
   {

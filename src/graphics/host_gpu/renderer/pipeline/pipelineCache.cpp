@@ -26,6 +26,7 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvDriverSimplify.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
+#include "graphics/shader/recompiler/ir/CompiledInfoSerial.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "kytyGitVersion.h"
@@ -116,6 +117,17 @@ Common::LiveControl::Switch g_widest_table_layouts("widest_table_layouts", 1);
 // (ProgramCache::Get); 0: it is translated on the GPU thread at its first draw, as without the
 // option.
 Common::LiveControl::Switch g_defer_stage_programs("defer_stage_programs", 1);
+
+// 1 (a test, not for play): a recorded program that is prepared from the stores (its plan from
+// the plan store, its module from the module store: ProgramCache::TakeStored) is translated as
+// well, as before the plan store, and the two are compared: the plan's bytes, whether it has a
+// walker and a look-ahead plan, the specialization, the module and its info. A difference is
+// logged ("Plan store: MISMATCH") and ends the emulator. Every start then costs what it did
+// before the store, and more.
+Common::LiveControl::Switch  g_plan_store_verify("plan_store_verify", 0);
+// Records prepared from the stores, and records translated (PrepareRecord).
+Common::LiveControl::Counter g_prepared_stored("prepared_stored");
+Common::LiveControl::Counter g_prepared_translated("prepared_translated");
 
 // Whether a guest program may store to guest memory, GDS or a storage image, going by its
 // instructions alone. A draw of such a program must not be left out (PendingDrawBlocker::
@@ -777,10 +789,14 @@ struct PipelineCache::ProgramCache {
 	// `serve_for`: the resources of the draw a stage record with code_only was made for: its
 	// module is the code-only one when that is the record's specialization or serves it there,
 	// and the record's own otherwise.
+	//
+	// Without a translation when the stores have what one would give (TakeStored), unless
+	// `use_stores` is false (the comparison of plan_store_verify).
 	template <typename Record>
 	bool PrepareRecord(const Record& record, PreparedProgram& prepared, bool code_only = false,
 	                   bool                                          plan_only = false,
-	                   const ShaderRecompiler::IR::ResourceSnapshot* serve_for = nullptr) const {
+	                   const ShaderRecompiler::IR::ResourceSnapshot* serve_for = nullptr,
+	                   bool                                          use_stores = true) const {
 		ProgramKey                       key;
 		ShaderComputeInputInfo           compute {};
 		ShaderVertexInputInfo            vertex {};
@@ -832,11 +848,30 @@ struct PipelineCache::ProgramCache {
 		if (code_only) {
 			unstored.emplace();
 		}
-		try {
+		const auto stored = use_stores ? TakeStored(record, options, code_only, plan_only, serve_for,
+		                                            first, prepared, specialization, result)
+		                               : Stored::Missing;
+		if (stored != Stored::Missing) {
+			g_prepared_stored.Add();
+			prepared_stored.fetch_add(1, std::memory_order_relaxed);
+			if (stored != Stored::Module) {
+				if (g_plan_store_verify.On()) {
+					VerifyStored(record, prepared, stored == Stored::Plans, first, code_only,
+					             plan_only, serve_for);
+				}
+				return stored == Stored::Plans;
+			}
+		} else try {
 			const Common::RecoverableFatalScope recoverable;
 			auto source = ShaderRecompiler::PrepareShaderSource(*record.code, options);
 			if (!source.calls.empty() || source.unsupported_call_pc != UINT32_MAX) return false;
 			auto translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
+			if (use_stores) {
+				g_prepared_translated.Add();
+				prepared_translated.fetch_add(1, std::memory_order_relaxed);
+				// For the next session, which then translates nothing (TakeStored).
+				KeepPlan(options, *record.code, translated.program);
+			}
 			if (code_only) {
 				auto from_code = ShaderRecompiler::IR::CodeOnlySpecialization(translated.program);
 				if (!from_code.has_value()) return false;
@@ -908,7 +943,138 @@ struct PipelineCache::ProgramCache {
 		    .code_only      = code_only,
 		});
 		prepared.push_data_cursors.push_back(record.push_data_cursor);
+		if (stored == Stored::Module && g_plan_store_verify.On()) {
+			VerifyStored(record, prepared, true, first, code_only, plan_only, serve_for);
+		}
 		return true;
+	}
+
+	// What TakeStored found: nothing (the record is translated), that the record's translation
+	// fails, the program's plans (`plan_only`), or the plans and the record's module.
+	enum class Stored { Missing, Fails, Plans, Module };
+
+	// PrepareRecord's translation, from the stores: the program's plan and the specialization of
+	// its code alone from the plan store (KeepPlan kept them when an earlier session of this
+	// build, or its precompile pass, translated the program), the record's module from the
+	// module store. A module is there only because this build compiled it for that
+	// specialization, so the specialization is one the program takes (SpecializationApplies).
+	// `first`: the plans are loaded into `prepared`; the walker of the plan is compiled here, as
+	// an extraction compiles it, the look-ahead's by the walker queue.
+	// Anything missing or unreadable: Missing, and nothing of `prepared` is touched.
+	template <typename Record>
+	Stored TakeStored(const Record& record, const ShaderRecompiler::CompileOptions& options,
+	                  bool code_only, bool plan_only,
+	                  const ShaderRecompiler::IR::ResourceSnapshot* serve_for, bool first,
+	                  PreparedProgram&                              prepared,
+	                  ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                  std::optional<StoredCompile>&                 result) const {
+		namespace IR = ShaderRecompiler::IR;
+		StoredPlan stored;
+		if (!FindStoredPlan(options, *record.code, stored)) return Stored::Missing;
+		auto wanted = record.specialization;
+		if (code_only) {
+			// (A program whose code gives none: its translation fails the same way.)
+			if (!stored.code_only.has_value()) return Stored::Fails;
+			wanted = *stored.code_only;
+		}
+		try {
+			// (A plan the walker compiler refuses: translated, which says so.)
+			const Common::RecoverableFatalScope recoverable;
+			const auto load = [&](IR::ResourcePlan& plan, IR::SrtWalkerCompilation compilation) {
+				return IR::LoadResourcePlan(stored.plan, plan, IR::SrtWalkerLoads::Reader,
+				                            compilation);
+			};
+			if constexpr (!std::is_same_v<Record, ComputeProgramRecord>) {
+				// The code-only module of a stage where it serves the draw (see PrepareRecord).
+				if (record.code_only && !plan_only && serve_for != nullptr &&
+				    stored.code_only.has_value() && !(*stored.code_only == wanted)) {
+					IR::ResourcePlan plan;
+					if (!load(plan, IR::SrtWalkerCompilation::Now)) return Stored::Missing;
+					if (IR::SpecializationServes(plan, *stored.code_only, wanted, true, serve_for)) {
+						wanted = *stored.code_only;
+					}
+				}
+			}
+			StoredCompile module;
+			if (!plan_only &&
+			    !FindStoredModule(options, wanted, record.push_data_cursor, *record.code, module)) {
+				return Stored::Missing;
+			}
+			if (first) {
+				IR::ResourcePlan                  plan;
+				std::unique_ptr<IR::ResourcePlan> ahead;
+				if (!load(plan, IR::SrtWalkerCompilation::Now)) return Stored::Missing;
+				if (lookahead != nullptr && SlotOf(options.stage) != LookaheadSlot::None &&
+				    plan.srt_code != nullptr) {
+					ahead = std::make_unique<IR::ResourcePlan>();
+					if (!load(*ahead, IR::SrtWalkerCompilation::Deferred)) return Stored::Missing;
+				}
+				prepared.plan           = std::move(plan);
+				prepared.lookahead_plan = std::move(ahead);
+			}
+			if (plan_only) return Stored::Plans;
+			specialization = std::move(wanted);
+			result         = std::move(module);
+			return Stored::Module;
+		} catch (const Common::RecoverableFatal&) {
+			return Stored::Missing;
+		}
+	}
+
+	// plan_store_verify: the record prepared again by a translation, and compared with what
+	// the stores gave (`prepared`; `taken`: whether they gave it, or said that it fails).
+	template <typename Record>
+	void VerifyStored(const Record& record, const PreparedProgram& prepared, bool taken, bool first,
+	                  bool code_only, bool plan_only,
+	                  const ShaderRecompiler::IR::ResourceSnapshot* serve_for) const {
+		namespace IR = ShaderRecompiler::IR;
+		PreparedProgram check;
+		const bool      ok = PrepareRecord(record, check, code_only, plan_only, serve_for, false);
+		const char*     what = nullptr;
+		if (ok != taken) {
+			what = "whether the record can be prepared";
+		} else if (ok && first) {
+			const auto& a = check.plan;
+			const auto& b = prepared.plan;
+			if (IR::SaveResourcePlan(a) != IR::SaveResourcePlan(b)) {
+				what = "the plan";
+			} else if ((a.srt_code != nullptr) != (b.srt_code != nullptr) ||
+			           a.srt_user_data != b.srt_user_data || a.srt_captures != b.srt_captures ||
+			           a.user_data_reads != b.user_data_reads ||
+			           a.selector_keys.size() != b.selector_keys.size()) {
+				what = "the plan's walker";
+			} else if ((check.lookahead_plan != nullptr) != (prepared.lookahead_plan != nullptr) ||
+			           (check.lookahead_plan != nullptr &&
+			            IR::SaveResourcePlan(*check.lookahead_plan) !=
+			                IR::SaveResourcePlan(*prepared.lookahead_plan))) {
+				what = "the look-ahead plan";
+			}
+		}
+		if (what == nullptr && ok && !plan_only) {
+			const auto& a = check.permutations.back();
+			const auto& b = prepared.permutations.back();
+			if (!(a.specialization == b.specialization)) {
+				what = "the specialization";
+			} else if (a.spirv_hash != b.spirv_hash) {
+				what = "the module";
+			} else if (!IR::SameCompiledInfo(a.program, b.program)) {
+				what = "the module's info";
+			} else if (a.code_only != b.code_only ||
+			           check.push_data_cursors.back() != prepared.push_data_cursors.back()) {
+				what = "the permutation";
+			}
+		}
+		for (const auto& permutation: check.permutations) {
+			graphics.device.destroyShaderModule(permutation.handle.module, nullptr);
+		}
+		if (what != nullptr) {
+			PipelineCacheLog("Plan store: MISMATCH: {} of shader {:016x} (stage {}) from the "
+			                 "stores is not what its translation gives",
+			                 what, record.shader_hash, static_cast<uint32_t>(prepared.plan.stage));
+			EXIT("plan store: %s of shader %016" PRIx64 " differs from its translation\n", what,
+			     record.shader_hash);
+		}
+		plan_store_verified.fetch_add(1, std::memory_order_relaxed);
 	}
 
 	// Every record of the job's program; null when none of them translates any more.
@@ -962,13 +1128,21 @@ struct PipelineCache::ProgramCache {
 			slot.state   = Preparation::State::Done;
 			state.running--;
 			if (state.running == 0 && state.next == state.jobs.size()) {
+				// ("translated": prepared, with or without a translation.)
 				PipelineCacheLog(
 				    "Programs prepared ahead: {} of {} recorded or built from their code translated "
-				    "in {:.1f} s ({} failed)",
+				    "in {:.1f} s ({} failed); {} of their records came from the stores, {} were "
+				    "translated{}",
 				    state.counts.prepared, state.counts.queued,
 				    std::chrono::duration<double>(std::chrono::steady_clock::now() - state.started)
 				        .count(),
-				    state.counts.failed);
+				    state.counts.failed, prepared_stored.load(std::memory_order_relaxed),
+				    prepared_translated.load(std::memory_order_relaxed),
+				    g_plan_store_verify.On()
+				        ? fmt::format(" (plan_store_verify: {} compared with a translation, none "
+				                      "differs)",
+				                      plan_store_verified.load(std::memory_order_relaxed))
+				        : std::string {});
 			}
 			state.changed.notify_all();
 		}
@@ -2249,6 +2423,11 @@ struct PipelineCache::ProgramCache {
 	std::chrono::steady_clock::time_point         next_lookahead_report {};
 	// Programs translated ahead of their first use (StartPreparation); null without.
 	std::unique_ptr<Preparation> preparation;
+	// Records PrepareRecord took from the stores, records it translated, and records
+	// plan_store_verify compared (helper threads count).
+	mutable std::atomic<uint64_t> prepared_stored {0};
+	mutable std::atomic<uint64_t> prepared_translated {0};
+	mutable std::atomic<uint64_t> plan_store_verified {0};
 	// Stage programs helper threads translate while their draws are left out (see Deferral):
 	// whether the option is on, whether the draw Get is asked about may be left out
 	// (GetGraphicsPrograms sets it), whether the last Get left its draw out, the plans under way
@@ -2306,6 +2485,8 @@ PrecompileOutcome PrecompileComputeProgram(GraphicContext& graphics, vk::Pipelin
 			return std::nullopt;
 		}
 		auto       translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
+		// The plan a session needs of the program, so that it does not translate it for that.
+		KeepPlan(options, *record.code, translated.program);
 		const auto specialization =
 		    code_only ? ShaderRecompiler::IR::CodeOnlySpecialization(translated.program)
 		              : std::optional(record.specialization);
@@ -2453,6 +2634,8 @@ bool PipelineCache::TranslateRecordedStage(GraphicContext&            graphics,
 			return false;
 		}
 		auto translated     = ShaderRecompiler::TranslateProgram(source.decoded, options);
+		// (As for a compute program: the plan for the sessions.)
+		KeepPlan(options, *record.code, translated.program);
 		auto specialization = record.specialization;
 		if (record.code_only) {
 			auto from_code = ShaderRecompiler::IR::CodeOnlySpecialization(translated.program);
@@ -2842,6 +3025,7 @@ PipelineCache::~PipelineCache() {
 	(void)Save();
 	ShaderRecompiler::Spirv::SetSimplifiedStore(nullptr);
 	SetModuleStore(nullptr, 0);
+	SetPlanStore(nullptr);
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
 			(void)key;
@@ -3038,6 +3222,18 @@ void PipelineCache::InitializeDriverCache() {
 	{
 		const auto counts = m_module_store->GetCounts();
 		PipelineCacheLog("Compiled modules: {} stored ({} MiB)", counts.loaded,
+		                 counts.file_bytes >> 20u);
+	}
+	// And what a translation gives besides its modules (a program's resource plan, the
+	// specialization of its code alone), so that a session whose programs an earlier one or the
+	// pass before play translated needs no translation to have them ready. The same build's
+	// file only, like the modules'.
+	m_plan_store = std::make_unique<ModuleStore>(
+	    std::filesystem::path("_PipelineCache") / (title_id + ".v1.plans"), ModuleStoreBuild());
+	SetPlanStore(m_plan_store.get());
+	{
+		const auto counts = m_plan_store->GetCounts();
+		PipelineCacheLog("Resource plans: {} stored ({} MiB)", counts.loaded,
 		                 counts.file_bytes >> 20u);
 	}
 	const auto path         = Common::PathToString(m_driver_cache_path);
@@ -4388,6 +4584,13 @@ bool PipelineCache::Save() {
 		const auto counts = m_module_store->GetCounts();
 		PipelineCacheLog("Compiled modules: {} taken from the store, {} compiled and kept, {} "
 		                 "damaged; {} MiB stored",
+		                 counts.found, counts.inserted, counts.damaged, counts.file_bytes >> 20u);
+	}
+	if (m_plan_store != nullptr) {
+		m_plan_store->Flush();
+		const auto counts = m_plan_store->GetCounts();
+		PipelineCacheLog("Resource plans: {} taken from the store, {} kept, {} damaged; {} MiB "
+		                 "stored",
 		                 counts.found, counts.inserted, counts.damaged, counts.file_bytes >> 20u);
 	}
 	m_driver_cache_writer.Wait();

@@ -42,6 +42,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/resourceLookahead.h"
+#include "graphics/host_gpu/renderer/pipeline/storedModules.h"
 #include "graphics/host_gpu/renderer/rayTracing.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
@@ -2018,6 +2019,71 @@ ShaderRecompiler::IR::ResourcePlan LoadedResourcePlan(const char *name,
   return plan;
 }
 
+// What a session keeps of a translation (the plan store, storedModules.h) is what the
+// translation gives: the bytes of its plan and the specialization of its code alone, found again
+// under the options' static inputs and the code, and under nothing else. Every compiled case
+// goes through here.
+void CheckPlanStore(const char *name, ShaderRecompiler::CompileOptions options,
+                    std::span<const u32> code,
+                    const ShaderRecompiler::IR::Program &program) {
+  using namespace ShaderRecompiler::IR;
+  static const auto store = [] {
+    const auto dir =
+        std::filesystem::temp_directory_path() / "kyty_plan_store_tests";
+    std::filesystem::remove_all(dir);
+    return std::make_unique<ModuleStore>(dir / "title.v1.plans", "tests");
+  }();
+  // What every key starts from in the emulator (the host's shader profile is
+  // one device's for a whole run; the cases here have their own).
+  const auto profile = options.profile != nullptr ? *options.profile
+                                                  : ShaderRecompiler::Spirv::Profile{};
+  const std::array<uint64_t, 10> variant = {
+      profile.maintenance8,       profile.native_float_min_max,
+      profile.ordered_float_min_max, profile.device_clock_period_ps,
+      profile.robust_buffer_access,  profile.r8_srgb_views,
+      profile.r8g8_srgb_views,       profile.relaxed_float,
+      profile.ray_query,             profile.driver_simplify};
+  SetModuleStore(nullptr, XXH3_64bits(variant.data(), sizeof(variant)));
+  SetPlanStore(store.get());
+  StoredPlan stored;
+  // (Dumps and debug info come from a translation: nothing is kept or taken.)
+  if (options.dump_ir || options.early_dump || options.emit_debug_info) {
+    KeepPlan(options, code, program);
+    Require(name, "plan store", !FindStoredPlan(options, code, stored),
+            "a plan was kept for options that ask for a translation's output");
+    options.dump_ir = options.early_dump = options.emit_debug_info = false;
+  }
+  KeepPlan(options, code, program);
+  const auto bytes = SaveResourcePlan(ExtractResourcePlan(program));
+  Require(name, "plan store",
+          FindStoredPlan(options, code, stored) && stored.plan == bytes &&
+              stored.code_only == CodeOnlySpecialization(program),
+          "the plan store did not give back what the translation gives");
+  ResourcePlan loaded;
+  Require(name, "plan store",
+          LoadResourcePlan(stored.plan, loaded, SrtWalkerLoads::Reader) &&
+              SaveResourcePlan(loaded) == bytes,
+          "the stored plan did not load");
+  // Other inputs of the translation name another record.
+  std::vector<u32> more(options.user_data.begin(), options.user_data.end());
+  more.push_back(0);
+  auto other = options;
+  other.user_data = more;
+  StoredPlan none;
+  Require(name, "plan store", !FindStoredPlan(other, code, none),
+          "a plan was found for another user-data count");
+  other = options;
+  other.wave_size ^= 96u;
+  Require(name, "plan store", !FindStoredPlan(other, code, none),
+          "a plan was found for another wave size");
+  if (code.size() > 1) {
+    Require(name, "plan store",
+            !FindStoredPlan(options, code.first(code.size() - 1), none),
+            "a plan was found for other code");
+  }
+  SetPlanStore(nullptr);
+}
+
 CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   auto user_data =
       MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
@@ -2051,6 +2117,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
 
   auto translated = ShaderRecompiler::TranslateProgram(test.code, options);
   auto resource_plan = LoadedResourcePlan(test.name, translated.program);
+  CheckPlanStore(test.name, options, test.code, translated.program);
   ShaderRecompiler::IR::ResourceSnapshot resources;
   ShaderRecompiler::IR::ResourceSpecialization specialization;
   const std::array workgroup_counts{test.dispatch_x, test.dispatch_y, test.dispatch_z};

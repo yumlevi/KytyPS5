@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -47,6 +48,39 @@ CompileThroughStore(ShaderRecompiler::TranslateResult                   translat
                     const ShaderRecompiler::IR::ResourceSpecialization& specialization,
                     uint32_t push_data_start_dword, std::span<const uint32_t> code,
                     const std::function<bool(const std::vector<uint32_t>&)>& valid);
+
+// The module CompileThroughStore would return for these inputs, when the store has it. Nothing
+// is compiled: the caller has no translation (see FindStoredPlan). A module is in the store
+// only because a compilation of this build made it from the same inputs, so the specialization
+// is one the program takes.
+[[nodiscard]] bool FindStoredModule(const ShaderRecompiler::CompileOptions&             options,
+                                    const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+                                    uint32_t push_data_start_dword, std::span<const uint32_t> code,
+                                    StoredCompile& result);
+
+// The plan store: what the translation of a program gives besides its modules, kept across
+// sessions like them (a second ModuleStore file of the same build; its keys start from the
+// module store's variant). A session translated every recorded program at its start only to have
+// these again: for Saros 12,500 programs, 15 to 18 s before the game's first frame, with the
+// modules already coming from their store.
+void SetPlanStore(ModuleStore* store);
+[[nodiscard]] ModuleStore::Counts PlanStoreCounts();
+
+struct StoredPlan {
+	// IR::SaveResourcePlan's bytes of the plan IR::ExtractResourcePlan makes of the program.
+	std::vector<uint8_t> plan;
+	// IR::CodeOnlySpecialization of the program; none when it has none.
+	std::optional<ShaderRecompiler::IR::ResourceSpecialization> code_only;
+};
+// What KeepPlan kept of the program `code` translates to with `options` (their static inputs
+// name it, as they name its modules without a specialization). False when the store has none.
+[[nodiscard]] bool FindStoredPlan(const ShaderRecompiler::CompileOptions& options,
+                                  std::span<const uint32_t> code, StoredPlan& stored);
+// Keeps them for `program`, the translation of `code` with `options`, unless the store has them
+// or the plan's bytes do not load back to the same bytes. Not for a program with calls (its code
+// is linked at run time; the callers do not get here with one).
+void KeepPlan(const ShaderRecompiler::CompileOptions& options, std::span<const uint32_t> code,
+              const ShaderRecompiler::IR::Program& program);
 
 } // namespace Libs::Graphics
 

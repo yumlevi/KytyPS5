@@ -59,6 +59,8 @@ public:
 	// The module of `key`: its SPIR-V into `words`, its info's bytes into `info`. False, both
 	// untouched or unspecified, if the store has none or its bytes are damaged.
 	[[nodiscard]] bool Find(const Key& key, std::vector<uint32_t>& words, std::vector<uint8_t>& info);
+	// Whether the store has a record of `key` (its bytes are checked when they are read).
+	[[nodiscard]] bool Contains(const Key& key) const;
 	// Remembers the module of `key` (a key that is known already keeps its record); the writer
 	// thread appends it to the file.
 	void Insert(const Key& key, std::span<const uint32_t> words, std::span<const uint8_t> info);

@@ -37,6 +37,30 @@ Extract(const Libs::Graphics::ShaderRecompiler::IR::Program &program) {
             !LoadResourcePlan(std::span(bytes).first(bytes.size() - 1u), truncated) &&
             !LoadResourcePlan(extended, padded),
         "resource plan did not round-trip through its exact cache bytes");
+  // The bytes hold neither how the walker loads guest memory nor whether it is compiled at
+  // the load: a session loads a plan with the reader's loads, and its look-ahead copy without
+  // a walker, which the walker queue adds.
+  ResourcePlan reader, deferred;
+  Check(LoadResourcePlan(bytes, reader, SrtWalkerLoads::Reader) &&
+            SaveResourcePlan(reader) == bytes &&
+            (reader.srt_code != nullptr) == (loaded.srt_code != nullptr) &&
+            reader.srt_user_data == loaded.srt_user_data &&
+            reader.srt_captures == loaded.srt_captures &&
+            reader.user_data_reads == loaded.user_data_reads,
+        "resource plan did not load for the reader's loads");
+  Check(LoadResourcePlan(bytes, deferred, SrtWalkerLoads::Reader,
+                         SrtWalkerCompilation::Deferred) &&
+            deferred.srt_code == nullptr && SaveResourcePlan(deferred) == bytes &&
+            deferred.user_data_reads == loaded.user_data_reads,
+        "resource plan did not load without its walker");
+  if (loaded.srt_code != nullptr) {
+    CompileSrtWalker(deferred, {}, SrtWalkerLoads::Reader);
+    Check(deferred.srt_code != nullptr &&
+              deferred.srt_code->getSize() == reader.srt_code->getSize() &&
+              deferred.srt_user_data == reader.srt_user_data &&
+              deferred.srt_captures == reader.srt_captures,
+          "a walker compiled after the load is not the one of the load");
+  }
   return loaded;
 }
 

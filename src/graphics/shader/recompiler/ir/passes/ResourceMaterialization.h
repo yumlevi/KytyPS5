@@ -87,8 +87,12 @@ ResourcePlan ExtractResourcePlan(const Program&       program,
 
 // Shader cache record of a plan; loading it into a default-constructed plan rebuilds the walker
 // and scratch state like extraction. A failed load leaves a plan that must not be used.
+// `loads` and `compilation` are ExtractResourcePlan's: the bytes hold neither, so one record
+// gives the plan of any of them.
 std::vector<uint8_t> SaveResourcePlan(const ResourcePlan& plan);
-bool                 LoadResourcePlan(std::span<const uint8_t> bytes, ResourcePlan& plan);
+bool                 LoadResourcePlan(std::span<const uint8_t> bytes, ResourcePlan& plan,
+                                      SrtWalkerLoads       loads       = SrtWalkerLoads::Direct,
+                                      SrtWalkerCompilation compilation = SrtWalkerCompilation::Now);
 
 // The user-data slots (SGPR minus the plan's user_data_base) the plan's values read, one bit each
 // for slots below 64; a slot at or above 64 sets every bit.
