@@ -78,6 +78,15 @@ with them; other places and machines will differ.
 
 ### Smoother frames
 
+- **The frame rate no longer sinks while you stay in a place, and over a long session.** The
+  emulator brings back, every frame, the memory the game reads after the GPU has written it.
+  It learned such memory from the game's reads and never unlearned it: after a minute and a
+  half of play it brought back 2,600 pieces a frame of which the game still read 350, and in
+  a session of 25 minutes 4,000. A spot of Saros that runs at 54.6 fps right after a start ran
+  at 45 in that session. Now the emulator asks Windows which of those pieces the game still
+  touches and drops the others: the same scene goes from 52.5 fps back to 57.5 within a
+  minute of standing there. While running through new places the gain is small.
+  `KYTY_HOT_PROBE=0` turns it off.
 - **A frame is shown when it is done, not at the next tick of a 60 Hz clock** (after the
   Demon's Souls fork's `KYTY_VRR`; the Jetsku and the Ghost of Yōtei forks do the same). A
   finished frame used to wait for the emulator's next vblank, so a game that renders 50 frames
@@ -567,6 +576,18 @@ unmodified `saros` branch gave 37 fps and the first batch of changes below 47.9.
   35.0 to 35.6 fps in four off/on rounds on a busy PC (`gpu_scalars`). The waits that remain
   are values the host needs itself: two counts that go into a buffer's address, the thread
   counts of two indirect dispatches, and a command list the game builds on the GPU.
+- **The hot set loses the pages the game no longer reads** (`hot_probe`, seconds; 0: off). A
+  page became hot at a game thread's read or store and stayed hot for as long as the GPU wrote
+  it: served ahead it never faults again, so nothing said whether it was still used, and
+  Unreal's transient memory is written by the GPU in every frame. A page taken out of the
+  process's working set (`VirtualUnlock`) comes back at its next access through the guest's
+  addresses, and `QueryWorkingSetEx` says whether it is back; the emulator's own accesses go
+  through the other view of the memory and do not count. A page that has been hot for two
+  seconds is taken out and asked every five seconds: untouched three times in a row, it leaves
+  the set; touched, it is asked after twice as long each time. 10 to 40 µs a frame. A scene
+  after 90 s of play: 1,450 pages brought back a frame and 52.5 fps, 540 pages and 57.5 fps a
+  minute later (GPU thread 19.0 to 17.4 ms, the card 16.1 to 14.7 ms). A played session of
+  137 s, replayed: 55.0 to 56.0 fps in five runs with it, 52.2 and 55.1 without.
 
 ### The game's stores into tracked memory
 
