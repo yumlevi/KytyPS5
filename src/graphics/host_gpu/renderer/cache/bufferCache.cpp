@@ -1271,8 +1271,21 @@ void BufferCache::EvictColdHotPages(uint64_t keep) {
 	std::nth_element(touched.begin(), coldest, touched.end());
 	// Pages touched by the current request stay.
 	const auto threshold = std::min(*coldest, keep - 1u);
-	std::erase_if(m_hot_pages,
-	              [&](const auto& entry) { return entry.second.touched <= threshold; });
+	std::erase_if(m_hot_pages, [&](const auto& entry) {
+		if (entry.second.touched > threshold) {
+			return false;
+		}
+		// A download of the page that is still on its way must not be published once the page
+		// is gone from the set: a GPU write recorded from now on no longer moves its epoch
+		// (NoteGpuWrite walks the set), so the download would pass for current and put its
+		// older bytes over that write's. And a page still readable with a write pending has no
+		// download to count on any more: it faults from here on.
+		entry.second.epoch->fetch_add(1, std::memory_order_acq_rel);
+		if (m_memory_tracker.IsGpuModifiedReadable(entry.first, CACHING_PAGESIZE)) {
+			m_memory_tracker.SetGpuModifiedReadable(entry.first, CACHING_PAGESIZE, false);
+		}
+		return true;
+	});
 }
 
 void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size) {

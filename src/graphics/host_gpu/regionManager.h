@@ -179,6 +179,19 @@ public:
 			return;
 		}
 		RegionBits mask(bits, start, end);
+		if constexpr (clear && source == DirtySource::Gpu) {
+			// A publication: the bytes first (they go through the backing, whatever the pages'
+			// protection), then the pages. Made readable first, a page showed a guest thread
+			// that read it at that moment the bytes of before the GPU's write.
+			for (const auto [first, last]: mask) {
+				func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
+			}
+			const StateChange change(*this);
+			bits.UnsetRange(start, end);
+			m_stale_readable.UnsetRange(start, end);
+			UpdateProtection<false, true>();
+			return;
+		}
 		if constexpr (clear) {
 			const StateChange change(*this);
 			bits.UnsetRange(start, end);
