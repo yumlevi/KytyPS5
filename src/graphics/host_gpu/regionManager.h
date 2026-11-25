@@ -124,6 +124,27 @@ public:
 		}
 	}
 
+	[[nodiscard]] uint64_t Address() const noexcept { return m_cpu_addr; }
+
+	// A GPU write of the range is recorded: its pages become GPU-dirty, and those of `keep` that
+	// were clean stay readable with their bytes of before (stale readable, see SetStaleReadable)
+	// in the same protection update. Marked first and made readable again afterwards, each such
+	// page took two protection requests that cancel (with the hot set of 16,384 pages about
+	// eight page changes per page a frame, a millisecond of the GPU thread). A page that was
+	// GPU-dirty already holds a write whose bytes are not in guest memory: it is not kept.
+	void MarkGpuWritten(uint64_t offset, uint64_t size, const RegionBits* keep) {
+		const auto [start, end] = GetPageRange(offset, size);
+		RegionBits range;
+		range.SetRange(start, end);
+		const auto        fresh = range & ~m_gpu_dirty;
+		const StateChange change(*this);
+		m_gpu_dirty.SetRange(start, end);
+		if (keep != nullptr) {
+			m_stale_readable |= fresh & *keep;
+		}
+		UpdateProtection<true, true>();
+	}
+
 	// A GPU-dirty page whose guest bytes are still current (every earlier GPU write of it was
 	// published before the pending one was recorded) stays readable: the guest sees what the
 	// console would show before the pending write executes, and the publish of that write

@@ -81,6 +81,10 @@ Common::LiveControl::Switch g_hot_window("hot_window", 1);
 // it only after a signal of that submission, which the completion thread delivers after the
 // publication). 0: the page faults from the write on, as a page outside the hot set does.
 Common::LiveControl::Switch  g_stale_readable("stale_readable", 1);
+// 1: a hot page that stays readable through a GPU write gets that state in the protection update
+// that marks the write (RegionManager::MarkGpuWritten); 0: it is made unreadable by the mark and
+// readable again right after, two protection requests that cancel.
+Common::LiveControl::Switch g_keep_marked("keep_marked", 1);
 // A test's handle on the time between what announces a submission and its hot pages' bytes: the
 // publication of a submission's hot-page downloads waits this many microseconds first. With the
 // operations run as queued (publish_first 0) that is time in which the guest, told the work is
@@ -1927,7 +1931,11 @@ bool BufferCache::UploadCpuModified(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    copies.emplace_back(total_size, buffer.Offset(address), bytes);
 		    total_size += bytes;
 	    },
-	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); },
+	    // (The hot pages NoteGpuWrite found clean stay readable through this write, in the state
+	    // change that marks it: keep_marked 0 marks first and makes them readable afterwards.)
+	    is_written && g_keep_marked.On() ? std::span<const uint64_t>(m_keep_readable) : std::span<const uint64_t>(),
+	    CACHING_PAGESIZE);
 	if (source) {
 		RecordUpload(buffer, source, copies);
 	}
@@ -2053,7 +2061,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	m_memory_tracker.SetGpuModifiedReadable(m_make_unreadable, CACHING_PAGESIZE, false);
-	m_memory_tracker.SetGpuModifiedReadable(m_keep_readable, CACHING_PAGESIZE, true);
+	if (!g_keep_marked.On()) {
+		m_memory_tracker.SetGpuModifiedReadable(m_keep_readable, CACHING_PAGESIZE, true);
+	}
 	m_make_unreadable.clear();
 	m_keep_readable.clear();
 	if (is_written) {

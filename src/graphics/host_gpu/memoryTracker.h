@@ -94,9 +94,13 @@ public:
 		});
 	}
 
+	// `keep` (is_written only): pages of `keep_size` bytes, ascending, that stay readable through
+	// the write where they were clean (RegionManager::MarkGpuWritten); they need not lie inside
+	// [vaddr, size).
 	template <typename RangeFunc, typename UploadFunc>
 	void ForEachUploadRange(uint64_t vaddr, uint64_t size, bool is_written, RangeFunc&& range_func,
-	                        UploadFunc&& upload_func) {
+	                        UploadFunc&& upload_func, std::span<const uint64_t> keep = {},
+	                        uint64_t keep_size = 0) {
 		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
 		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
@@ -120,8 +124,26 @@ public:
 		upload_func();
 		if (is_written) {
 			Iterate<false>(vaddr, size,
-			               [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-				               manager->ChangeState<DirtySource::Gpu, true>(offset, bytes);
+			               [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+				               if (keep.empty()) {
+					               manager->ChangeState<DirtySource::Gpu, true>(offset, bytes);
+				               } else {
+					               // The region's pages among `keep`, wherever in the region the
+					               // written range lies (a kept page can begin before it).
+					               const auto base = manager->Address();
+					               RegionBits bits;
+					               bool       any = false;
+					               for (const auto page: keep) {
+						               if (page >= base && page - base < TRACKER_REGION_SIZE) {
+							               const auto first = static_cast<size_t>((page - base) / TRACKER_PAGE_SIZE);
+							               const auto last  = std::min<size_t>(
+                                               first + static_cast<size_t>(keep_size / TRACKER_PAGE_SIZE), TRACKER_REGION_PAGES);
+							               bits.SetRange(first, last);
+							               any = true;
+						               }
+					               }
+					               manager->MarkGpuWritten(offset, bytes, any ? &bits : nullptr);
+				               }
 				               manager->lock.unlock();
 			               });
 		}
