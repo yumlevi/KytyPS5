@@ -403,6 +403,24 @@ std::string MeasureLine(const std::string& head, double seconds) {
 		const double base  = earlier != begin.thread_cpu.end() ? earlier->second : 0.0;
 		line += Format(" %s=%.2f", name.c_str(), 1000.0 * (cpu - base) / frames);
 	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// What the process holds at the window's end (its working set and what it has committed,
+	// the game's memory included) and what the PC has left.
+	PROCESS_MEMORY_COUNTERS_EX memory {};
+	memory.cb = sizeof(memory);
+	if (K32GetProcessMemoryInfo(GetCurrentProcess(),
+	                            reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memory),
+	                            sizeof(memory)) != 0) {
+		line += Format(" | mem_mb working=%.0f private=%.0f",
+		               static_cast<double>(memory.WorkingSetSize) / 1048576.0,
+		               static_cast<double>(memory.PrivateUsage) / 1048576.0);
+		MEMORYSTATUSEX system {};
+		system.dwLength = sizeof(system);
+		if (GlobalMemoryStatusEx(&system) != 0) {
+			line += Format(" free=%.0f", static_cast<double>(system.ullAvailPhys) / 1048576.0);
+		}
+	}
+#endif
 	return line;
 }
 

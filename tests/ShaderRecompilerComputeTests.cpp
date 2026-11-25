@@ -2937,10 +2937,11 @@ public:
                                                   UINT64_MAX) ==
           vk::Result::eSuccess;
       scheduler.TryPopPendingOperations();
+      const auto refresh_queries = counter_queries - open_queries;
       dispatcher.vkGetSemaphoreCounterValue = get_counter;
       Require("SchedulerTimeline", "draw drain refresh",
               empty_queries == 0 && open_queries == 0 && open_completed == 3 &&
-                  signaled && completed == 4,
+                  signaled && completed == 4 && refresh_queries == 1,
               "the drain before a draw read the timeline for nothing, or left "
               "a finished tick's operation queued");
     }

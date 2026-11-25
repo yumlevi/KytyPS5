@@ -22,6 +22,25 @@ bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t f
 
 enum class Pm4ProcessResult { Complete, Blocked };
 
+// What reads guest memory as a packet's input (CommandProcessor::SettleMemoryRead).
+enum class SettleSite : uint8_t {
+	Semaphore,
+	Commands,
+	CalledCommands,
+	EmptyArgs,
+	NumInstances,
+	ZPass,
+	DrawCount,
+	DrawArgs,
+	DeferredCount,
+	DeferredArg,
+	DispatchArgs,
+	CondExec,
+	Compare,
+	Registers,
+	Count
+};
+
 enum class ContextStateOperation : uint32_t {
 	Clear     = 0,
 	Push      = 1,
@@ -137,7 +156,7 @@ public:
 	// settlement above, then a readback of the bytes recorded GPU work writes. The packet
 	// runs after that work, but a page with a pending GPU write may keep its old bytes readable
 	// for the guest's CPU threads (BufferCache::NoteGpuWrite), so a plain read can be stale.
-	void SettleMemoryRead(const volatile void* address, uint64_t size);
+	void SettleMemoryRead(const volatile void* address, uint64_t size, SettleSite site);
 	// Reads a packet input when that takes no wait: pending labels are settled, and the bytes
 	// are read only if no recorded GPU work holds one of them (they are then the guest's and
 	// current). False, with nothing read, when the GPU holds some: the caller does without.

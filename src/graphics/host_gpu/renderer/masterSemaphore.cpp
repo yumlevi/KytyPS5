@@ -4,8 +4,10 @@
 #include "common/debugCounters.h"
 #include "common/gpuTiming.h"
 #include "common/liveControl.h"
+#include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
 
+#include <atomic>
 #include <chrono>
 #include <cinttypes>
 
@@ -24,6 +26,22 @@ MasterSemaphore::MasterSemaphore(GraphicContext& graphics): m_graphics(graphics)
 
 	const auto result = m_graphics.device.createSemaphore(&create_info, nullptr, &m_semaphore);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || m_semaphore == nullptr);
+	// What a read of the timeline costs with this driver (the first semaphore only): the paths
+	// that poll it are paced by that.
+	static std::atomic<bool> measured {false};
+	if (!measured.exchange(true)) {
+		constexpr int Reads   = 2000;
+		uint64_t      counter = 0;
+		const auto    begin   = std::chrono::steady_clock::now();
+		for (int i = 0; i < Reads; i++) {
+			(void)m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
+		}
+		const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                    std::chrono::steady_clock::now() - begin)
+		                    .count();
+		LOGF("Timeline semaphore: a read of its counter takes %" PRId64 " ns\n",
+		     static_cast<int64_t>(ns / Reads));
+	}
 }
 
 MasterSemaphore::~MasterSemaphore() {

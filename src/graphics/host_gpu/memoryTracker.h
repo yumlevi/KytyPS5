@@ -104,8 +104,11 @@ public:
 	                        uint64_t keep_size = 0) {
 		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
+		uint64_t regions = 0;
+		uint64_t locked  = 0;
 		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			if (!is_written) {
+				regions++;
 				// Most uploads find nothing to copy: answer that without the lock the guest's
 				// write faults take (a concurrent fault is ordered after this check, as it
 				// would be after a locked one).
@@ -115,6 +118,7 @@ public:
 				if (bool modified = true; manager->TryQueryUnlocked(query, modified) && !modified) {
 					return;
 				}
+				locked++;
 			}
 			manager->lock.lock();
 			manager->ForEachModifiedRange<DirtySource::Cpu, true>(offset, bytes, range_func);
@@ -123,6 +127,15 @@ public:
 			}
 		});
 		upload_func();
+		if (!is_written) {
+			// (Counted for a measurement: a count lost to another thread's does not matter.)
+			const auto add = [](std::atomic<uint64_t>& counter, uint64_t value) {
+				counter.store(counter.load(std::memory_order_relaxed) + value, std::memory_order_relaxed);
+			};
+			add(m_upload_calls, 1);
+			add(m_upload_regions, regions);
+			add(m_upload_locked, locked);
+		}
 		if (is_written) {
 			Iterate<false>(vaddr, size,
 			               [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
@@ -241,6 +254,20 @@ public:
 		return manager->MarkCpuModifiedAhead(vaddr % TRACKER_REGION_SIZE, pages) * TRACKER_PAGE_SIZE;
 	}
 
+	// What read bindings' looks for guest stores (ForEachUploadRange, not written) did since the
+	// last call: the calls, the tracking regions they went through, and those of them that were
+	// locked (a CPU-modified page to take, or a state change under way).
+	struct UploadCounts {
+		uint64_t calls   = 0;
+		uint64_t regions = 0;
+		uint64_t locked  = 0;
+	};
+	[[nodiscard]] UploadCounts TakeUploadCounts() noexcept {
+		return {m_upload_calls.exchange(0, std::memory_order_relaxed),
+		        m_upload_regions.exchange(0, std::memory_order_relaxed),
+		        m_upload_locked.exchange(0, std::memory_order_relaxed)};
+	}
+
 	// Write-protects the pages of a region that TakeUploadRanges took. Safe from any thread.
 	static void ProtectTaken(RegionManager* region) {
 		std::scoped_lock lock(region->lock);
@@ -287,6 +314,9 @@ private:
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::mutex                                     m_region_mutex;
 	PageManager&                                   m_page_manager;
+	std::atomic<uint64_t>                          m_upload_calls {0};
+	std::atomic<uint64_t>                          m_upload_regions {0};
+	std::atomic<uint64_t>                          m_upload_locked {0};
 };
 
 } // namespace Libs::Graphics

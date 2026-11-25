@@ -49,6 +49,15 @@ public:
 	// stream suspended on a memory condition is retried now instead of at the next poll.
 	void NotifyMemoryWritten();
 
+	// What the other guest queues hold while the GPU thread processes a submission (for a
+	// measurement: would a wait of this thread leave it without work?).
+	struct OtherWork {
+		uint32_t running  = 0; // The queue of the submission being processed.
+		uint32_t runnable = 0; // Other queues whose first submission is not suspended.
+		uint32_t waiting  = 0; // Submissions queued, all queues.
+	};
+	[[nodiscard]] OtherWork OtherQueuesWork();
+
 private:
 	static constexpr uint32_t ComputePipeCount     = 7;
 	static constexpr uint32_t QueuesPerComputePipe = 8;
@@ -84,6 +93,7 @@ private:
 	std::deque<Common::UniqueFunction<void>>       m_commands;
 	std::atomic_uint32_t                           m_pending_commands {0};
 	uint32_t                                       m_next_queue        = 0;
+	uint32_t                                       m_running_queue     = UINT32_MAX;
 	uint32_t                                       m_submission_count  = 0;
 	bool                                           m_processing        = false;
 	bool                                           m_accepting         = true;

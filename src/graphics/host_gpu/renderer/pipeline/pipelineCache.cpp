@@ -274,6 +274,50 @@ bool ReadShaderDataMemory(void* userdata, uint64_t address, uint32_t flat_offset
 	return true;
 }
 
+// Walks that waited for bytes the GPU still wrote (ScalarReadCache::ReadBack), a frame: all of
+// them, those of a draw's stages (a dispatch leaves the words only its shader takes to the GPU,
+// gpu_scalars; a draw reads every word back), and the draws' loads of such words that made a
+// walk wait. walk_read_log 1: a line for each walk that waited, with the stage, the program and
+// the ranges it read back with the first word of each as it reads now.
+Common::LiveControl::Counter g_walk_readbacks("walk_readbacks");
+Common::LiveControl::Counter g_walk_readbacks_draw("walk_readbacks_draw");
+Common::LiveControl::Counter g_walk_data_readbacks("walk_data_readbacks");
+Common::LiveControl::Switch  g_walk_read_log("walk_read_log", 0);
+
+void NoteWalkReadBacks(ShaderType stage, uint64_t hash, std::span<const ScalarReadRange> ranges) {
+	g_walk_readbacks.Add();
+	if (stage != ShaderType::Compute) {
+		g_walk_readbacks_draw.Add();
+	}
+	if (!g_walk_read_log.On()) {
+		return;
+	}
+	std::string text;
+	for (const auto& [address, size]: ranges) {
+		uint32_t word = 0;
+		(void)Libs::LibKernel::Memory::TryReadBacking(address, &word,
+		                                              std::min<uint64_t>(size, sizeof(word)));
+		text += fmt::format(" 0x{:x}+{}={:08x}", address, size, word);
+	}
+	PipelineCacheLog("Walk read: stage {} program {:016x}, {} ranges:{}", static_cast<int>(stage),
+	                 hash, ranges.size(), text);
+}
+
+// The reader of a draw's data-only loads: as the walk's own read, counted when it has to wait.
+bool ReadShaderDataMemoryCounted(void* userdata, uint64_t address, uint32_t /*flat_offset*/,
+                                 uint32_t& value) {
+	auto* cache = static_cast<GuestScalarReadCache*>(userdata);
+	if (cache == nullptr) {
+		ReadShaderScalarMemoryUncached(address, {&value, 1});
+		return true;
+	}
+	if (!cache->ReadUnlessGpuDirty(address, value)) {
+		g_walk_data_readbacks.Add();
+		cache->Read(address, {&value, 1});
+	}
+	return true;
+}
+
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
 	if (!Config::GraphicsDebugDumpEnabled()) {
@@ -1615,6 +1659,9 @@ struct PipelineCache::ProgramCache {
 			// (Compute only: a draw's flat buffer is uploaded inside a render pass.)
 			if (g_gpu_scalars.On()) runtime.read_data_memory = ReadShaderDataMemory;
 		}
+		if constexpr (!std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			runtime.read_data_memory = ReadShaderDataMemoryCounted;
+		}
 		const auto stage           = options.stage;
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;
@@ -1676,6 +1723,7 @@ struct PipelineCache::ProgramCache {
 					read_cache.Prefetch({});
 					if (const auto read_backs = read_cache.ReadBacks(); !read_backs.empty()) {
 						cached.walk_read_backs.assign(read_backs.begin(), read_backs.end());
+						NoteWalkReadBacks(stage, params.hash, read_backs);
 					}
 				}
 				if (!materialized) return SkipUnavailableDraw(stage, params.hash, input_info);

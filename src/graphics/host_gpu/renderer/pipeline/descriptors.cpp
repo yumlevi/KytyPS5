@@ -1145,11 +1145,47 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	}
 }
 
+// KYTY_WATCH_WRITE=<guest address>[,<address>...] (hexadecimal): a line for each buffer a
+// program binds for writing that holds one of the addresses, with the program, the bound range
+// and the buffer's stride and record count as its descriptor gives them: who writes the bytes a
+// walk or a packet waits for ("Walk read:", "Settle read:"), and how much it binds around them.
+static const std::vector<uint64_t>& WatchedWrites() {
+	static const std::vector<uint64_t> addresses = [] {
+		std::vector<uint64_t> list;
+		const char*           text = std::getenv("KYTY_WATCH_WRITE");
+		while (text != nullptr && *text != 0) {
+			char*      end   = nullptr;
+			const auto value = std::strtoull(text, &end, 16);
+			if (end == text) break;
+			list.push_back(value);
+			text = *end == ',' ? end + 1 : end;
+		}
+		return list;
+	}();
+	return addresses;
+}
+
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	const auto& program  = *prepared.runtime->program;
 	const auto& snapshot = *prepared.runtime->resources;
 	const auto& layout   = program.bindings;
+	if (const auto& watched = WatchedWrites(); !watched.empty()) {
+		for (const auto& resource: program.info.buffers) {
+			const auto index = resource.descriptor_index;
+			if (index == UINT32_MAX || !(resource.written || resource.atomic)) continue;
+			const auto& source = prepared.buffer_sources[index];
+			for (const auto address: watched) {
+				if (address >= source.address && address - source.address < source.size) {
+					LOGF("Watch write: program %016" PRIx64 " binds 0x%" PRIx64 "+0x%" PRIx64
+					     " for writing (binding %u%s%s), which holds 0x%" PRIx64 " at +0x%" PRIx64 "\n",
+					     program.shader_hash, source.address, source.size, index,
+					     resource.read ? ", read too" : "", resource.atomic ? ", atomic" : "", address,
+					     address - source.address);
+				}
+			}
+		}
+	}
 
 	prepared.buffers.resize(layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
 	// The uploads of the stage's buffers share their barriers.

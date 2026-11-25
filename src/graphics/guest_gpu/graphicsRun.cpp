@@ -316,7 +316,7 @@ template void CommandProcessor::WaitRegMem<uint64_t>(uint32_t, const uint64_t*, 
 
 void CommandProcessor::MemSemaphore(uint64_t* counter, bool signal, bool write) {
 	// The counter is a packet input in guest memory, maybe written by recorded GPU work.
-	SettleMemoryRead(counter, sizeof(uint64_t));
+	SettleMemoryRead(counter, sizeof(uint64_t), SettleSite::Semaphore);
 	if (!signal) {
 		m_renderer.NoteCommandOrderingPoint();
 	}
@@ -596,8 +596,9 @@ void GuestGpu::ThreadRun(void* data) {
 				submission  = std::move(queue.front());
 				queue.pop_front();
 				gpu->m_submission_count--;
-				gpu->m_next_queue = (static_cast<uint32_t>(selected_queue) + 1) % QueueCount;
-				gpu->m_processing = true;
+				gpu->m_next_queue    = (static_cast<uint32_t>(selected_queue) + 1) % QueueCount;
+				gpu->m_running_queue = static_cast<uint32_t>(selected_queue);
+				gpu->m_processing    = true;
 			}
 		}
 		if (should_stop) {
@@ -636,6 +637,7 @@ void GuestGpu::ThreadRun(void* data) {
 		}();
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
+		gpu->m_running_queue = UINT32_MAX;
 		if (!complete) {
 			submission.blocked        = true;
 			submission.blocked_writes = writes;
@@ -653,6 +655,19 @@ void GuestGpu::ThreadRun(void* data) {
 			gpu->m_idle.SignalAll();
 		}
 	}
+}
+
+GuestGpu::OtherWork GuestGpu::OtherQueuesWork() {
+	Common::LockGuard lock(m_queue_mutex);
+	OtherWork         work {.running = m_running_queue};
+	for (uint32_t id = 0; id < QueueCount; id++) {
+		const auto& queue = m_queues[id];
+		work.waiting += static_cast<uint32_t>(queue.size());
+		if (id != m_running_queue && !queue.empty() && !queue.front().blocked) {
+			work.runnable++;
+		}
+	}
+	return work;
 }
 
 void GuestGpu::NotifyMemoryWritten() {
@@ -732,7 +747,7 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	EXIT_IF(commands.size() > UINT32_MAX);
 	if (execution.m_buffer_stack.empty() && !commands.empty()) {
 		// The parser reads the commands like a packet input (SettleMemoryRead).
-		SettleMemoryRead(commands.data(), commands.size_bytes());
+		SettleMemoryRead(commands.data(), commands.size_bytes(), SettleSite::Commands);
 		execution.m_buffer_stack.push_back({commands});
 	}
 	execution.m_suspended     = false;
@@ -1056,7 +1071,7 @@ void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands,
 	    m_lookahead_active && g_lookahead_replan.On() && !commands.empty() &&
 	    LibKernel::Memory::HasGpuDirtyBytes(reinterpret_cast<uint64_t>(commands.data()),
 	                                        commands.size_bytes());
-	SettleMemoryRead(commands.data(), commands.size_bytes());
+	SettleMemoryRead(commands.data(), commands.size_bytes(), SettleSite::CalledCommands);
 	g_current_execution->m_next_buffer = commands;
 	g_current_execution->m_chain       = chain;
 }
@@ -1201,9 +1216,39 @@ void CommandProcessor::SetNumInstances(uint32_t num_instances) {
 	}
 }
 
-void CommandProcessor::SettleMemoryRead(const volatile void* address, uint64_t size) {
+// The packets' reads of their own inputs that found bytes the GPU still wrote, and so waited for
+// the GPU, a frame, by what read (SettleSite, in its order).
+static Common::LiveControl::Counter g_settle_reads[] = {
+    Common::LiveControl::Counter("settle_semaphore"),
+    Common::LiveControl::Counter("settle_commands"),
+    Common::LiveControl::Counter("settle_called_commands"),
+    Common::LiveControl::Counter("settle_empty_args"),
+    Common::LiveControl::Counter("settle_num_instances"),
+    Common::LiveControl::Counter("settle_zpass"),
+    Common::LiveControl::Counter("settle_draw_count"),
+    Common::LiveControl::Counter("settle_draw_args"),
+    Common::LiveControl::Counter("settle_deferred_count"),
+    Common::LiveControl::Counter("settle_deferred_arg"),
+    Common::LiveControl::Counter("settle_dispatch_args"),
+    Common::LiveControl::Counter("settle_cond_exec"),
+    Common::LiveControl::Counter("settle_compare"),
+    Common::LiveControl::Counter("settle_registers"),
+};
+static_assert(std::size(g_settle_reads) == static_cast<size_t>(SettleSite::Count));
+
+void CommandProcessor::SettleMemoryRead(const volatile void* address, uint64_t size,
+                                        SettleSite site) {
 	SettleLabelAccess(address, size);
 	const std::pair<uint64_t, uint64_t> range {reinterpret_cast<uint64_t>(address), size};
+	if (Common::LiveControl::Active() &&
+	    LibKernel::Memory::HasGpuDirtyBytes(range.first, range.second)) {
+		auto& counter = g_settle_reads[static_cast<size_t>(site)];
+		counter.Add();
+		if (g_settle_log.On()) {
+			LOGF("Settle read: %s 0x%" PRIx64 "+%" PRIu64 "\n", counter.Name(), range.first,
+			     range.second);
+		}
+	}
 	LibKernel::Memory::ReadGpuDirtyBytes(std::span {&range, 1u});
 }
 
@@ -1498,7 +1543,8 @@ bool CommandProcessor::IndirectDrawsNothing(uint64_t args_address, uint32_t max_
 	// 170 a frame at that spot, and the waits cost more than the draws: 49.5 to 45.0 fps.
 	if (g_skip_empty_indirect.Get() >= 2 && count != 0) {
 		SettleMemoryRead(reinterpret_cast<const void*>(args_address),
-		                 static_cast<uint64_t>(count - 1u) * stride_in_bytes + 2 * sizeof(uint32_t));
+		                 static_cast<uint64_t>(count - 1u) * stride_in_bytes + 2 * sizeof(uint32_t),
+		                 SettleSite::EmptyArgs);
 	}
 	for (uint32_t i = 0; i < count; i++) {
 		// Both kinds of record begin with the vertex or index count and the instance count.
@@ -1517,7 +1563,8 @@ bool CommandProcessor::IndirectDrawsNothing(uint64_t args_address, uint32_t max_
 }
 uint32_t CommandProcessor::NumInstances() {
 	if (m_num_instances_addr != 0) {
-		SettleMemoryRead(reinterpret_cast<const void*>(m_num_instances_addr), sizeof(uint32_t));
+		SettleMemoryRead(reinterpret_cast<const void*>(m_num_instances_addr), sizeof(uint32_t),
+		                 SettleSite::NumInstances);
 		m_num_instances      = *reinterpret_cast<const uint32_t*>(m_num_instances_addr);
 		m_num_instances_addr = 0;
 	}
@@ -1556,7 +1603,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 		case 0x03:
 			// The wait selector applies only to Z-pass query readiness.
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
-			SettleMemoryRead(address, sizeof(uint64_t));
+			SettleMemoryRead(address, sizeof(uint64_t), SettleSite::ZPass);
 			value = *reinterpret_cast<const volatile uint64_t*>(address);
 			break;
 		default: EXIT("unknown predication op: 0x%08" PRIx32 "\n", op);
@@ -1673,7 +1720,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 	uint32_t draw_count = max_count_or_count;
 	if (count_addr != nullptr) {
-		SettleMemoryRead(count_addr, sizeof(uint32_t));
+		SettleMemoryRead(count_addr, sizeof(uint32_t), SettleSite::DrawCount);
 		draw_count = std::min(uint32_t {*count_addr}, max_count_or_count);
 	}
 	if (draw_count == 0) {
@@ -1711,7 +1758,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	SettleMemoryRead(
 	    reinterpret_cast<const void*>(args_addr),
 	    static_cast<uint64_t>(draw_count - 1u) * stride_in_bytes +
-	        (indexed ? sizeof(vk::DrawIndexedIndirectCommand) : sizeof(vk::DrawIndirectCommand)));
+	        (indexed ? sizeof(vk::DrawIndexedIndirectCommand) : sizeof(vk::DrawIndirectCommand)), SettleSite::DrawArgs);
 	const uint32_t max_indices = m_index_buffer_size != 0 ? m_index_buffer_size : UINT32_MAX;
 	for (uint32_t i = 0; i < draw_count; i++) {
 		const auto addr = args_addr + static_cast<uint64_t>(i) * stride_in_bytes;
@@ -1866,7 +1913,7 @@ void CommandProcessor::SettleIndirectDrawState(bool registers, bool num_instance
 		// and a packet that drew nothing left it as it was.
 		uint32_t count = value.max_count;
 		if (value.count_addr != nullptr) {
-			SettleMemoryRead(value.count_addr, sizeof(uint32_t));
+			SettleMemoryRead(value.count_addr, sizeof(uint32_t), SettleSite::DeferredCount);
 			const uint32_t selected = *value.count_addr;
 			count                   = std::min(selected, value.max_count);
 		}
@@ -1892,7 +1939,7 @@ void CommandProcessor::SettleIndirectDrawState(bool registers, bool num_instance
 				break;
 		}
 		const auto* argument_addr = reinterpret_cast<const uint32_t*>(args_addr) + word;
-		SettleMemoryRead(argument_addr, sizeof(uint32_t));
+		SettleMemoryRead(argument_addr, sizeof(uint32_t), SettleSite::DeferredArg);
 		const auto argument = *argument_addr;
 		if (value.field == Field::InstanceCount) {
 			m_num_instances      = argument;
@@ -1924,7 +1971,7 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 		// Settled, the backing holds them; the guest mapping of the page may still fault on
 		// other GPU-written bytes.
 		SettleMemoryRead(reinterpret_cast<const void*>(args_addr),
-		                 sizeof(vk::DispatchIndirectCommand));
+		                 sizeof(vk::DispatchIndirectCommand), SettleSite::DispatchArgs);
 		vk::DispatchIndirectCommand args {};
 		if (!LibKernel::Memory::TryReadBacking(args_addr, &args, sizeof(args))) {
 			std::memcpy(&args, reinterpret_cast<const void*>(args_addr), sizeof(args));

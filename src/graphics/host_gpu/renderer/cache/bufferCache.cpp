@@ -50,6 +50,11 @@ Common::LiveControl::Counter g_inplace_waits("inplace_waits");
 Common::LiveControl::Counter g_inplace_bytes("inplace_bytes");
 Common::LiveControl::Counter g_inplace_us("inplace_us");
 Common::LiveControl::Counter g_invalidations_gpu("invalidate_gpu");
+// Read bindings' looks for guest stores, a frame (MemoryTracker::TakeUploadCounts): the looks,
+// the 4 MiB tracking regions they went through and the regions that were locked.
+Common::LiveControl::Counter g_upload_looks("upload_looks");
+Common::LiveControl::Counter g_upload_regions("upload_regions");
+Common::LiveControl::Counter g_upload_regions_locked("upload_regions_locked");
 
 // 1: a BDA synchronization leaves the write protection of the pages it takes and their copies
 // into staging memory to the upload worker (uploadWorker.h); 0: the GPU thread makes both.
@@ -145,6 +150,28 @@ Common::LiveControl::Counter g_guest_copies("guest_copies");
 Common::LiveControl::Counter g_guest_copy_bytes("guest_copy_bytes");
 Common::LiveControl::Counter g_guest_copy_waits("guest_copy_waits");
 Common::LiveControl::Counter g_guest_copy_again("guest_copy_again");
+// Why a guest thread's readback was not handed to it (HandOffGuestCopy), so that the GPU thread
+// recorded a download for it and waited for the GPU: the bytes were published meanwhile (no
+// wait), the range or the buffer does not allow a copy (pages not whole, no mapping, out of
+// bounds), the buffer's last write is not submitted yet, or the bytes are none or too many.
+Common::LiveControl::Counter g_handoff_published("handoff_published");
+Common::LiveControl::Counter g_handoff_shape("handoff_shape");
+Common::LiveControl::Counter g_handoff_open("handoff_open");
+Common::LiveControl::Counter g_handoff_size("handoff_size");
+// The downloads the GPU thread recorded and waited for, by who asked: a store of its own (the
+// emulated command processor's), a guest thread's store, a guest thread's read, a read of its
+// own (a walk); the passes that waited, and what each part of the wait took: the GPU, then the
+// completion thread.
+Common::LiveControl::Counter g_sync_store_own("sync_store_own");
+Common::LiveControl::Counter g_sync_store_guest("sync_store_guest");
+Common::LiveControl::Counter g_sync_read_guest("sync_read_guest");
+Common::LiveControl::Counter g_sync_read_own("sync_read_own");
+Common::LiveControl::Counter g_sync_passes("sync_passes");
+Common::LiveControl::Counter g_sync_gpu_us("sync_gpu_us");
+Common::LiveControl::Counter g_sync_completion_us("sync_completion_us");
+// 1: a line for each of those passes: what it waited for, for how long, and how far the GPU was
+// behind when it began (the submissions it had not finished).
+Common::LiveControl::Switch g_sync_log("sync_log", 0);
 
 // 1: a BDA synchronization uploads the guest's stores only into buffers shaders read through
 // the page table (BdaUse); a buffer only bindings use takes them when a binding is obtained, and
@@ -1361,6 +1388,10 @@ void BufferCache::ServeGuestReadbacks(std::span<const GuestReadback> requests) {
 			windows++;
 		}
 		if (result.copied) {
+			(request.kind == GuestReadback::Kind::Write
+			     ? (request.handoff != nullptr ? g_sync_store_guest : g_sync_store_own)
+			     : (request.done != nullptr ? g_sync_read_guest : g_sync_read_own))
+			    .Add();
 			if (submit_reason) {
 				// Rides the submission of an earlier request of the batch.
 				Common::GpuTiming::Sync().AddJoinedReadback(request.reason);
@@ -1372,8 +1403,32 @@ void BufferCache::ServeGuestReadbacks(std::span<const GuestReadback> requests) {
 	if (!publications.empty()) {
 		const Common::GpuTiming::SyncScope sync_reason(*submit_reason);
 		const auto                         tick = m_scheduler.CurrentTick();
+		const auto behind     = tick - std::min(tick, m_scheduler.GetMasterSemaphore().KnownGpuTick());
+		const auto wait_begin = std::chrono::steady_clock::now();
 		m_scheduler.Wait(tick);
+		const auto wait_gpu = std::chrono::steady_clock::now();
 		m_scheduler.WaitPriorityOperations(tick);
+		const auto wait_end = std::chrono::steady_clock::now();
+		g_sync_passes.Add();
+		g_sync_gpu_us.Add(static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::microseconds>(wait_gpu - wait_begin).count()));
+		g_sync_completion_us.Add(static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::microseconds>(wait_end - wait_gpu).count()));
+		if (g_sync_log.On()) {
+			const auto other = m_scheduler.Context().GetGpu().OtherQueuesWork();
+			LOGF("Sync pass: %s, %zu requests, first 0x%" PRIx64 "+%" PRIu64 ", waited %" PRId64
+			     " us for the GPU (%" PRIu64 " submissions behind) and %" PRId64
+			     " us for the completion thread; queue %u runs, %u other queues could, %u "
+			     "submissions wait\n",
+			     Common::GpuTiming::SyncReasonName(*submit_reason), requests.size(), requests[0].vaddr,
+			     requests[0].size,
+			     static_cast<int64_t>(
+			         std::chrono::duration_cast<std::chrono::microseconds>(wait_gpu - wait_begin).count()),
+			     behind,
+			     static_cast<int64_t>(
+			         std::chrono::duration_cast<std::chrono::microseconds>(wait_end - wait_gpu).count()),
+			     other.running, other.runnable, other.waiting);
+		}
 		for (auto& publish: publications) {
 			publish();
 		}
@@ -1747,6 +1802,7 @@ bool BufferCache::HandOffGuestCopy(const GuestReadback& request, Buffer& buffer,
 	// for them. (Finished ones are published by now: the request is served here, without a wait.)
 	if (const auto tick = SubmittedDownloadTick(base, size); tick != 0) {
 		if (m_scheduler.IsFree(tick)) {
+			g_handoff_published.Add();
 			return false;
 		}
 		copy->wait_tick = tick;
@@ -1758,8 +1814,12 @@ bool BufferCache::HandOffGuestCopy(const GuestReadback& request, Buffer& buffer,
 	// the copy), a write that is submitted, and not more bytes than the bus reads are worth.
 	const auto write_tick = buffer.gpu_write_tick;
 	if (((base | size) & (TRACKER_PAGE_SIZE - 1u)) != 0 || !buffer.IsHostReadable() ||
-	    buffer.gpu_write_open || write_tick >= m_scheduler.CurrentTick() ||
 	    !buffer.IsInBounds(base, size)) {
+		g_handoff_shape.Add();
+		return false;
+	}
+	if (buffer.gpu_write_open || write_tick >= m_scheduler.CurrentTick()) {
+		g_handoff_open.Add();
 		return false;
 	}
 	uint64_t dirty = 0;
@@ -1768,6 +1828,7 @@ bool BufferCache::HandOffGuestCopy(const GuestReadback& request, Buffer& buffer,
 		dirty += end - begin;
 	});
 	if (dirty == 0 || dirty > (uint64_t {g_guest_copy_max_kb.Get()} << 10u)) {
+		g_handoff_size.Add();
 		return false;
 	}
 	copy->buffer         = &buffer;
@@ -2809,6 +2870,11 @@ bool BufferCache::ConsumeCpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::RunGarbageCollector() {
+	if (const auto counts = m_memory_tracker.TakeUploadCounts(); counts.calls != 0) {
+		g_upload_looks.Add(counts.calls);
+		g_upload_regions.Add(counts.regions);
+		g_upload_regions_locked.Add(counts.locked);
+	}
 	RetireBdaTables();
 	ProbeBdaReaders();
 	KeepAccessedBdaBuffers();

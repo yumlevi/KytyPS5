@@ -54,6 +54,25 @@ void ForEachRun(size_t begin, size_t end, Pred&& pred, Fn&& fn) {
 // 0: only the reservation decides.
 Common::LiveControl::Switch  g_heap_by_content("heap_by_content", 1);
 Common::LiveControl::Counter g_heap_probes("heap_probes");
+// What Rebind and Commit do for the image tables a draw's shaders select from, a frame: the
+// calls; the walks over every element of a view because some image changed since its last
+// (heap_epoch) and the elements walked; the elements found changed there, by the colour
+// metadata look and by the retry of held ones; the scans of a view's probes for changed elements
+// and the probes scanned; the lookups of the metadata, held and new elements; and in Commit the
+// rebuilds of a view's list of images to bring to the read layout.
+Common::LiveControl::Counter g_heap_rebinds("heap_rebinds");
+Common::LiveControl::Counter g_heap_epoch_walks("heap_epoch_walks");
+Common::LiveControl::Counter g_heap_epoch_elements("heap_epoch_elements");
+Common::LiveControl::Counter g_heap_stale_epoch("heap_stale_epoch");
+Common::LiveControl::Counter g_heap_stale_dcc("heap_stale_dcc");
+Common::LiveControl::Counter g_heap_stale_held("heap_stale_held");
+Common::LiveControl::Counter g_heap_stale_scans("heap_stale_scans");
+Common::LiveControl::Counter g_heap_stale_probes("heap_stale_probes");
+Common::LiveControl::Counter g_heap_dcc_resolves("heap_dcc_resolves");
+Common::LiveControl::Counter g_heap_held_resolves("heap_held_resolves");
+Common::LiveControl::Counter g_heap_pending_resolves("heap_pending_resolves");
+Common::LiveControl::Counter g_heap_layout_walks("heap_layout_walks");
+Common::LiveControl::Counter g_heap_layout_elements("heap_layout_elements");
 
 bool Eligible(const IR::ImageHeapRequest& request) {
 	return request.count != 0u && request.step != 0u &&
@@ -622,17 +641,21 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 	auto&      textures = m_context.GetTextureCache();
 	const auto epoch    = Image::heap_epoch.load(std::memory_order_relaxed);
 	const auto serial   = Image::serials.load(std::memory_order_relaxed);
+	g_heap_rebinds.Add();
 	for (auto* view: m_active) {
 		bool       stale = false;
 		const auto mark  = [&](uint32_t index) { m_elements[index].stale = stale = true; };
 		if (view->resolve_epoch != epoch) {
 			view->resolve_epoch = epoch;
+			g_heap_epoch_walks.Add();
+			g_heap_epoch_elements.Add(view->elements.size());
 			for (const auto& [value, index]: view->elements) {
 				const auto& binding = m_elements[index].binding;
 				if (!binding.image_id) continue;
 				const auto* image = ImageOf(m_elements[index]);
 				if (image == nullptr || !image->registered || image->depth_id ||
 				    image->binding.needs_rebind) {
+					g_heap_stale_epoch.Add();
 					mark(index);
 				} else {
 					(void)textures.FindTexture(binding.image_id, binding.desc);
@@ -643,10 +666,12 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 		std::erase_if(view->dcc, [&](uint32_t index) {
 			const auto& element = m_elements[index];
 			if (element.refs == 0u || element.stale) return true;
+			g_heap_dcc_resolves.Add();
 			if (executor.ResolveTexture(IR::ImageHeapResource(view->profile, element.kind),
 			                            element.value).image_id == element.binding.image_id) {
 				return false;
 			}
+			g_heap_stale_dcc.Add();
 			mark(index);
 			return true;
 		});
@@ -656,14 +681,20 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 			std::erase_if(view->held, [&](uint32_t index) {
 				const auto& element = m_elements[index];
 				if (element.refs == 0u || element.stale) return true;
+				g_heap_held_resolves.Add();
 				const auto binding = executor.ResolveTexture(
 				    IR::ImageHeapResource(view->profile, element.kind), element.value);
-				if (binding.image_id) mark(index);
+				if (binding.image_id) {
+					g_heap_stale_held.Add();
+					mark(index);
+				}
 				// An unmapped texture stays null.
 				return binding.image_id || binding.desc.info.data.Empty();
 			});
 		}
 		if (stale) {
+			g_heap_stale_scans.Add();
+			g_heap_stale_probes.Add(view->count);
 			// A changed image needs a new element; pending draws still read the old one. The new
 			// element keeps the old value, since a view takes table changes only when acquired.
 			std::erase_if(view->elements,
@@ -678,6 +709,7 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 		}
 		for (const auto index: view->pending) {
 			if (m_elements[index].refs == 0u) continue;
+			g_heap_pending_resolves.Add();
 			auto binding = executor.ResolveTexture(
 			    IR::ImageHeapResource(view->profile, m_elements[index].kind),
 			    m_elements[index].value);
@@ -738,6 +770,8 @@ void ImageHeap::Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point,
 		Retire(*view);
 		if (view->layout_epoch != epoch) {
 			view->layout_epoch = epoch;
+			g_heap_layout_walks.Add();
+			g_heap_layout_elements.Add(view->elements.size());
 			view->away.clear();
 			for (const auto& [value, index]: view->elements) view->away.push_back(index);
 		}

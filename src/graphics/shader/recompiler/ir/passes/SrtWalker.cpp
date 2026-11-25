@@ -8,7 +8,10 @@
 
 #include <algorithm>
 #include <bit>
+#include <cinttypes>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -475,6 +478,9 @@ private:
 	void    MarkDataLoads(std::span<const Operand> reads, std::span<const Operand> conditions,
 	                      std::span<const std::vector<Operand>> descriptors,
 	                      std::span<const Operand> outputs);
+	void    Explain(std::span<const Operand> reads, std::span<const Operand> conditions,
+	                std::span<const std::vector<Operand>> descriptors,
+	                std::span<const Operand> outputs) const;
 
 	ResourcePlan&                                     m_plan;
 	Xbyak::CodeGenerator&                             m_code;
@@ -1366,6 +1372,73 @@ void WalkerCompiler::MarkDataLoads(std::span<const Operand> reads,
 	}
 }
 
+// KYTY_WALK_EXPLAIN=<shader hash>[,<hash>...] (hexadecimal): the walk compiled for each of those
+// shaders is printed to the console, to tell what a load whose bytes the walk waits for (a
+// "Walk read:" line, walk_read_log) is for: its nodes with their operands and the flat word a
+// data-only load is for, then what takes nodes: the block conditions, the flat words, the
+// descriptor words of each source and the outputs.
+static bool ExplainsWalk(uint64_t hash) {
+	static const std::vector<uint64_t> hashes = [] {
+		std::vector<uint64_t> list;
+		const char*           text = std::getenv("KYTY_WALK_EXPLAIN");
+		while (text != nullptr && *text != 0) {
+			char*      end   = nullptr;
+			const auto value = std::strtoull(text, &end, 16);
+			if (end == text) break;
+			list.push_back(value);
+			text = *end == ',' ? end + 1 : end;
+		}
+		return list;
+	}();
+	return std::ranges::find(hashes, hash) != hashes.end();
+}
+
+void WalkerCompiler::Explain(std::span<const Operand> reads, std::span<const Operand> conditions,
+                             std::span<const std::vector<Operand>> descriptors,
+                             std::span<const Operand> outputs) const {
+	const auto text = [](const Operand& operand) {
+		static constexpr const char* names[] = {"?", "const", "user", "base", "n"};
+		char                         buffer[48];
+		std::snprintf(buffer, sizeof(buffer), "%s:%" PRIx64,
+		              names[static_cast<size_t>(operand.kind)], operand.value);
+		return std::string(buffer);
+	};
+	const auto hash = m_plan.shader_hash;
+	std::printf("Walk explain %016" PRIx64 ": %zu nodes, %zu blocks, %zu flat words, %zu sources, "
+	            "%zu outputs\n",
+	            hash, m_nodes.size(), conditions.size(), reads.size(), descriptors.size(),
+	            outputs.size());
+	for (uint32_t index = 0; index < m_nodes.size(); ++index) {
+		const auto& node = m_nodes[index];
+		std::string args;
+		for (const auto& operand: node.args) args += " " + text(operand);
+		const auto name = ValueOpcodeName(node.inst->GetOpcode());
+		std::printf("Walk explain %016" PRIx64 "   n:%x %.*s context=%u result=%s data_flat=%d args:%s\n",
+		            hash, index, static_cast<int>(name.size()), name.data(), node.context,
+		            text(node.result).c_str(),
+		            node.data_flat == UINT32_MAX ? -1 : static_cast<int>(node.data_flat), args.c_str());
+	}
+	for (size_t block = 0; block < conditions.size(); ++block) {
+		std::printf("Walk explain %016" PRIx64 "   block %zu condition %s\n", hash, block,
+		            text(conditions[block]).c_str());
+	}
+	for (size_t slot = 0; slot < reads.size(); ++slot) {
+		std::printf("Walk explain %016" PRIx64 "   flat %u = %s\n", hash,
+		            m_plan.srt_reads[slot].flat_offset, text(reads[slot]).c_str());
+	}
+	for (size_t source = 0; source < descriptors.size(); ++source) {
+		std::string words;
+		for (const auto& operand: descriptors[source]) words += " " + text(operand);
+		std::printf("Walk explain %016" PRIx64 "   source %zu words:%s\n", hash, source,
+		            words.c_str());
+	}
+	for (size_t output = 0; output < outputs.size(); ++output) {
+		std::printf("Walk explain %016" PRIx64 "   output %zu = %s\n", hash, output,
+		            text(outputs[output]).c_str());
+	}
+	std::fflush(stdout);
+}
+
 void WalkerCompiler::Compile(std::span<const Value> values) {
 	auto&       c         = m_code;
 	const auto& sources   = m_plan.descriptor_sources;
@@ -1388,6 +1461,7 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 	}
 	for (const auto value: m_outputs) outputs.push_back(Evaluate(value, 0).operand);
 	if (resources && m_reader) MarkDataLoads(reads, conditions, descriptors, outputs);
+	if (resources && ExplainsWalk(m_plan.shader_hash)) Explain(reads, conditions, descriptors, outputs);
 	Layout();
 
 	Xbyak::Label pass, fail, reset;
