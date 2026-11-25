@@ -193,6 +193,16 @@ with them; other places and machines will differ.
   about 15 s on an i9-13900K, during which every thread works on them, instead of two minutes
   of play at a lower frame rate: the first three ten-second windows of a played-back session
   41.5, 46.3 and 42.4 fps before, 51.4, 52.7 and 45.9 after.
+- **That wait is gone from the second start on** (`_PipelineCache/<title>.v1.plans`,
+  `plan_store`). With the modules coming from their store, a start still translated every
+  recorded program again, only to learn which resources each one uses: 12,650 programs, 16 s
+  before the first frame. What a translation learns is now kept beside the modules (53 MiB for
+  Saros) and read at the next start: the first frame waits 0.2 s instead of 16.4 s, and a save
+  was loaded and playing after 29 s instead of 45. The first start after an emulator update
+  fills the file and waits as before. Like the modules, a record is checked when it is stored
+  and belongs to one build, device and set of shader settings; `KYTY_PLAN_STORE_VERIFY=1`
+  compares everything a start reads from the two stores with a fresh translation (15,388
+  records of Saros, none differed), and `KYTY_PLAN_STORE=0` starts as before.
 - **Shader work that runs beside the game stays on the efficiency cores** of a CPU that has
   eight or more of them (`background_ecores`), so it does not take turns with the threads that
   make frames.
@@ -410,6 +420,24 @@ with them; other places and machines will differ.
 
 ### Smaller things
 
+- **Fog and other volume effects no longer turn into flat or rainbow-coloured boxes.** In Saros
+  this showed from the moment an eclipse began, and after every start inside one: blocks of
+  flat white, purple or rainbow colour where fog, dust and light shafts belong. Both causes sat
+  in the table through which a game's shaders reach its textures by number (the bindless image
+  table):
+  - The game's volume textures are sparse: a small page table says where each part of the
+    volume lies in a big atlas. Those page tables are 32-bit integer textures, and the table
+    refused them (it holds float textures), so every page read as "page 0" and each volume was
+    drawn as a box of whatever the atlas holds there. They are now bound through a view that
+    hands the shader the integers' bits (`KYTY_BINDLESS_BITS=0`: refused as before).
+  - A number of the table was looked up once, when a shader first used it, and never again.
+    Saros rewrites some 160 entries of its texture table every frame, and when it gave a
+    number another texture the shader kept sampling the first one, whose memory by then held
+    something else. Now the entries in use are compared with the game's table once a frame
+    (about 30 µs), and a changed one goes to its new texture at once
+    (`KYTY_BINDLESS_REVALIDATE=0`: looked up once, as before). The texture it left is given
+    back a few frames later; before, it stayed loaded and was uploaded again whenever the game
+    wrote its memory.
 - **A white flash every ten seconds or so is gone.** For one frame the scene lost its
   ray-traced shadowing and showed raw, speckled, over-bright lighting, every 608 frames. A
   shader that walks the game's ray tracing structure read "no node here" from a page of it
@@ -631,6 +659,20 @@ start. `present_crop` 1 to 9 shows a part of the picture pixel for pixel in the 
   and, two seconds later, `MarkPerf #<n>` with the numbers of `measure` for those two seconds.
   For saying afterwards where in a long log something was seen on the screen (a wrong picture
   has no line of its own). A key mapping that uses F9 keeps it.
+- **The picture itself, from the emulator** (`shot <file>` on the live channel): the frame of
+  the next present is read back from the GPU and written as a 32-bit BMP, at the game's own
+  size and before overlays. A capture of the window from outside is black while Windows shows
+  a lock screen or a screen saver, and fails for a minimized window; this does not depend on
+  the window. `capture` on the same channel asks RenderDoc for a capture, as the F1 key does
+  (the emulator started with `--rd`).
+- **What the bindless image table gives the shaders** (counters in the performance log:
+  `bindless_resolved`, `bindless_refused_dimension`, `_class`, `_other`, `bindless_other_kind`,
+  `bindless_records_changed`, `bindless_moved`, `bindless_retried`, `bindless_slots_used`,
+  `bindless_slots_freed`, `bindless_heap_uses`, `bindless_refresh_kb`,
+  `bindless_revalidate_us`), and with
+  `bindless_log 1` (`KYTY_BINDLESS_LOG=1`) a line for every shader that reads through the
+  table, every heap made, every texture refused with the reason, and every entry the game
+  rewrote while a shader used it. This is what found the two causes of the flat boxes above.
 - **A play session can be played back along its path** (`replay <log> <from> [seconds]
   [oncamera]` on the live channel), as a benchmark of real play. A session's log already held
   every gamepad event with its time; it now also holds the camera of every frame (`Camera:`
