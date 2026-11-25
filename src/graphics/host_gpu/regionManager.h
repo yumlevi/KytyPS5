@@ -169,23 +169,35 @@ public:
 		}
 	}
 	// SetStaleReadable for each page (a guest address) of `page_size` bytes, with one protection
-	// update.
-	void SetStaleReadable(std::span<const uint64_t> pages, uint64_t page_size, bool readable) {
+	// update. Returns the pages it changed: for `readable` false, those that were readable.
+	size_t SetStaleReadable(std::span<const uint64_t> pages, uint64_t page_size, bool readable) {
+		if (!readable) {
+			// Usually none of them is: then nothing changes, and a change is what sends the
+			// questions asked without the lock (TryQueryUnlocked) to the lock.
+			size_t stale = 0;
+			for (const auto page: pages) {
+				const auto [start, end] = GetPageRange(page - m_cpu_addr, page_size);
+				stale += m_stale_readable.FirstRangeFrom(start).first < end ? 1u : 0u;
+			}
+			if (stale == 0) {
+				return 0;
+			}
+			const StateChange change(*this);
+			for (const auto page: pages) {
+				const auto [start, end] = GetPageRange(page - m_cpu_addr, page_size);
+				m_stale_readable.UnsetRange(start, end);
+			}
+			UpdateProtection<true, true>();
+			return stale;
+		}
 		const StateChange change(*this);
 		for (const auto page: pages) {
 			const auto [start, end] = GetPageRange(page - m_cpu_addr, page_size);
-			if (!readable) {
-				m_stale_readable.UnsetRange(start, end);
-			} else {
-				// (Only the GPU-dirty pages, as above.)
-				m_stale_readable |= RegionBits(m_gpu_dirty, start, end);
-			}
+			// (Only the GPU-dirty pages, as above.)
+			m_stale_readable |= RegionBits(m_gpu_dirty, start, end);
 		}
-		if (readable) {
-			UpdateProtection<false, true>();
-		} else {
-			UpdateProtection<true, true>();
-		}
+		UpdateProtection<false, true>();
+		return pages.size();
 	}
 	[[nodiscard]] bool IsStaleReadable(uint64_t offset, uint64_t size) const {
 		const auto [start, end] = GetPageRange(offset, size);

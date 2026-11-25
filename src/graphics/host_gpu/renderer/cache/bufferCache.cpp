@@ -76,18 +76,33 @@ Common::LiveControl::Switch g_readback_log("readback_log", 0);
 // fps, read-fault waits of the GPU thread 0.8 -> 0.0 a frame.
 Common::LiveControl::Switch g_hot_pages_max("hot_pages_max", 16384);
 Common::LiveControl::Switch g_hot_window("hot_window", 1);
+// From this size on a buffer's creation and its release are logged with their times.
+constexpr uint64_t LargeBufferBytes = 64ull << 20u;
+
 // 1: a hot page that is clean when the GPU writes it stays readable, with the bytes it had,
 // until the download that rode the write's submission is published (the game is taken to read
 // it only after a signal of that submission, which the completion thread delivers after the
 // publication). 0: the page faults from the write on, as a page outside the hot set does.
-// From this size on a buffer's creation and its release are logged with their times.
-constexpr uint64_t LargeBufferBytes = 64ull << 20u;
-
 Common::LiveControl::Switch  g_stale_readable("stale_readable", 1);
 // 1: a hot page that stays readable through a GPU write gets that state in the protection update
 // that marks the write (RegionManager::MarkGpuWritten); 0: it is made unreadable by the mark and
 // readable again right after, two protection requests that cancel.
 Common::LiveControl::Switch g_keep_marked("keep_marked", 1);
+// 1: the hot pages a GPU write stops being readable are made so with one protection update per
+// tracking region, before the epoch of any of them moves (NoteGpuWrite); 0: one page at a time,
+// each with a locked question and an update of its own, as before.
+Common::LiveControl::Switch  g_unreadable_merged("unreadable_merged", 1);
+// Hot pages a recorded GPU write made unreadable, and how many of them were still readable from
+// the write before (the ones that need a protection update).
+Common::LiveControl::Counter g_hot_unreadable_pages("hot_unreadable_pages");
+Common::LiveControl::Counter g_hot_unreadable_stale("hot_unreadable_stale");
+// 1: what the completion thread published is taken off the GPU-dirty bytes by runs of adjacent
+// pages (DrainPublished); 0: one 4 KiB page at a time, each with a question to the tracker and a
+// subtraction of its own, as before.
+Common::LiveControl::Switch  g_drain_runs("drain_runs", 1);
+// Published 4 KiB pages the drain went through, and the subtractions it made for them.
+Common::LiveControl::Counter g_drain_pages("drain_pages");
+Common::LiveControl::Counter g_drain_subtracts("drain_subtracts");
 // A test's handle on the time between what announces a submission and its hot pages' bytes: the
 // publication of a submission's hot-page downloads waits this many microseconds first. With the
 // operations run as queued (publish_first 0) that is time in which the guest, told the work is
@@ -1565,8 +1580,39 @@ void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size) {
 	if (m_hot_pages.empty()) {
 		return;
 	}
-	const auto first = vaddr & ~(CACHING_PAGESIZE - 1u);
-	const auto touch = ++m_hot_touch_sequence;
+	const auto first          = vaddr & ~(CACHING_PAGESIZE - 1u);
+	const auto touch          = ++m_hot_touch_sequence;
+	const bool stale_readable = g_stale_readable.On();
+	if (!g_unreadable_merged.On()) {
+		for (auto it = m_hot_pages.lower_bound(first);
+		     it != m_hot_pages.end() && it->first < vaddr + size; ++it) {
+			it->second.touched    = touch;
+			const bool unreadable = !stale_readable ||
+			                        m_memory_tracker.IsRegionGpuModified(it->first, CACHING_PAGESIZE);
+			if (unreadable && m_memory_tracker.IsGpuModifiedReadable(it->first, CACHING_PAGESIZE)) {
+				m_memory_tracker.SetGpuModifiedReadable(it->first, CACHING_PAGESIZE, false);
+				g_hot_unreadable_stale.Add();
+			}
+			it->second.epoch->fetch_add(1, std::memory_order_acq_rel);
+			m_pending_async.Add(it->first, CACHING_PAGESIZE);
+			if (unreadable) {
+				g_hot_unreadable_pages.Add();
+				m_make_unreadable.push_back(it->first);
+				Common::MemoryTrace::Note(Common::MemoryTrace::Kind::MakeUnreadable, it->first,
+				                          CACHING_PAGESIZE, m_scheduler.CurrentTick());
+			} else {
+				m_keep_readable.push_back(it->first);
+				Common::MemoryTrace::Note(Common::MemoryTrace::Kind::KeepReadable, it->first,
+				                          CACHING_PAGESIZE, m_scheduler.CurrentTick());
+			}
+		}
+		return;
+	}
+	// First what each hot page of the range becomes, nothing changed yet. (Nothing enters or
+	// leaves the hot set before the second pass: the pointers into it hold.)
+	auto& written = m_hot_written;
+	written.clear();
+	const auto unreadable_from = m_make_unreadable.size();
 	for (auto it = m_hot_pages.lower_bound(first);
 	     it != m_hot_pages.end() && it->first < vaddr + size; ++it) {
 		// A page served asynchronously never faults again, so the GPU writes keep it hot; it
@@ -1576,36 +1622,57 @@ void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size) {
 		// a page still holding an unpublished write must fault into a readback instead.
 		// (stale_readable 0: every page faults until its download is published, and a read
 		// that comes before counts as an early read.)
-		const bool unreadable = !g_stale_readable.On() ||
+		const bool unreadable = !stale_readable ||
 		                        m_memory_tracker.IsRegionGpuModified(it->first, CACHING_PAGESIZE);
-		// ... and stops being readable before its epoch moves: the epoch's move makes the
-		// completion thread leave out the bytes of the write before this one, and what announces
-		// that write follows at once. A page still readable then showed the bytes of before both.
-		if (unreadable && m_memory_tracker.IsGpuModifiedReadable(it->first, CACHING_PAGESIZE)) {
-			m_memory_tracker.SetGpuModifiedReadable(it->first, CACHING_PAGESIZE, false);
-		}
-		// The epoch advances before the write is marked GPU-dirty (SynchronizeBuffer): a publish
-		// that reads the old epoch under the region lock completes before the mark and a later
-		// one sees the new epoch and keeps the page dirty.
-		it->second.epoch->fetch_add(1, std::memory_order_acq_rel);
-		m_pending_async.Add(it->first, CACHING_PAGESIZE);
 		if (unreadable) {
 			m_make_unreadable.push_back(it->first);
-			Common::MemoryTrace::Note(Common::MemoryTrace::Kind::MakeUnreadable, it->first, CACHING_PAGESIZE,
-			                          m_scheduler.CurrentTick());
+			Common::MemoryTrace::Note(Common::MemoryTrace::Kind::MakeUnreadable, it->first,
+			                          CACHING_PAGESIZE, m_scheduler.CurrentTick());
 		} else {
 			m_keep_readable.push_back(it->first);
-			Common::MemoryTrace::Note(Common::MemoryTrace::Kind::KeepReadable, it->first, CACHING_PAGESIZE,
-			                          m_scheduler.CurrentTick());
+			Common::MemoryTrace::Note(Common::MemoryTrace::Kind::KeepReadable, it->first,
+			                          CACHING_PAGESIZE, m_scheduler.CurrentTick());
 		}
+		written.push_back({it->first, &it->second});
 	}
+	if (written.empty()) {
+		return;
+	}
+	// ... then the pages that hold an unpublished write stop being readable, before the epoch of
+	// any page moves: the epoch's move makes the completion thread leave out the bytes of the
+	// write before this one, and what announces that write follows at once. A page still
+	// readable then showed the bytes of before both. All of them with one hold of each tracking
+	// region's lock and one protection update: page by page, each took a locked question and,
+	// where it was readable, a lock and a protection request of its own.
+	if (const auto pages = std::span<const uint64_t>(m_make_unreadable).subspan(unreadable_from);
+	    !pages.empty()) {
+		g_hot_unreadable_pages.Add(pages.size());
+		g_hot_unreadable_stale.Add(
+		    m_memory_tracker.SetGpuModifiedReadable(pages, CACHING_PAGESIZE, false));
+	}
+	// ... and then the epochs advance, before the write is marked GPU-dirty (SynchronizeBuffer):
+	// a publish that reads the old epoch under the region lock completes before the mark and a
+	// later one sees the new epoch and keeps the page dirty.
+	uint64_t run_begin = written.front().first;
+	uint64_t run_end   = run_begin;
+	for (const auto& [page, hot]: written) {
+		hot->epoch->fetch_add(1, std::memory_order_acq_rel);
+		if (page != run_end) {
+			m_pending_async.Add(run_begin, run_end - run_begin);
+			run_begin = page;
+		}
+		run_end = page + CACHING_PAGESIZE;
+	}
+	m_pending_async.Add(run_begin, run_end - run_begin);
 }
 
 void BufferCache::DrainPublished() {
 	if (!m_published_pending.load(std::memory_order_acquire)) {
 		return;
 	}
-	std::vector<Published> published;
+	// (Both vectors keep their storage: the publishers append to the one drained last time.)
+	auto& published = m_published_drained;
+	published.clear();
 	{
 		std::lock_guard lock(m_published_mutex);
 		published.swap(m_published);
@@ -1617,14 +1684,55 @@ void BufferCache::DrainPublished() {
 	// caching page's epoch cannot decide this: a write to another tracker page of the caching
 	// page moves it (and the published bytes stayed dirty with a clean tracker page, so no
 	// download ever took them), and a hot page evicted and written again starts a new epoch.
-	for (const auto& entry: published) {
+	uint64_t   pages     = 0;
+	uint64_t   subtracts = 0;
+	const auto by_page   = [&](const Published& entry) {
 		for (auto page = entry.address; page < entry.address + entry.size;
 		     page += TRACKER_PAGE_SIZE) {
 			if (!m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE)) {
 				m_gpu_modified_ranges.Subtract(page, TRACKER_PAGE_SIZE);
+				subtracts++;
 			}
 		}
+	};
+	// The same answer for many pages at once: a run of entries that follow each other without a
+	// gap (a publication reports the dirty pages of a range in order; the pages of a buffer the
+	// game reads back whole arrive as a few hundred entries side by side) is clean as a whole,
+	// almost always, and then one question to the tracker and one subtraction do for it. A run
+	// with a page that was written again is decided entry by entry, and such an entry page by
+	// page as before: only pages the tracker calls clean are forgotten, whatever the grouping.
+	// Only this thread makes a page GPU-dirty, so a page clean at one question stays clean.
+	const bool runs = g_drain_runs.On();
+	for (size_t first = 0; first < published.size();) {
+		const auto begin = published[first].address;
+		auto       end   = begin + published[first].size;
+		auto       last  = first + 1;
+		// (Within one tracking region: one region's state decides a run.)
+		while (runs && last < published.size() && published[last].address == end &&
+		       end % TRACKER_REGION_SIZE != 0) {
+			end += published[last].size;
+			last++;
+		}
+		pages += (end - begin) / TRACKER_PAGE_SIZE;
+		if (runs && !m_memory_tracker.IsRegionGpuModified(begin, end - begin)) {
+			m_gpu_modified_ranges.Subtract(begin, end - begin);
+			subtracts++;
+		} else {
+			for (auto index = first; index < last; ++index) {
+				const auto& entry = published[index];
+				if (runs && last - first > 1 && entry.size > TRACKER_PAGE_SIZE &&
+				    !m_memory_tracker.IsRegionGpuModified(entry.address, entry.size)) {
+					m_gpu_modified_ranges.Subtract(entry.address, entry.size);
+					subtracts++;
+				} else {
+					by_page(entry);
+				}
+			}
+		}
+		first = last;
 	}
+	g_drain_pages.Add(pages);
+	g_drain_subtracts.Add(subtracts);
 }
 
 bool BufferCache::HandOffGuestCopy(const GuestReadback& request, Buffer& buffer, BufferId id,

@@ -447,6 +447,8 @@ private:
 	[[nodiscard]] uint64_t      SubmittedDownloadTick(uint64_t vaddr, uint64_t size);
 	std::vector<uint64_t>       m_keep_readable;
 	std::vector<uint64_t>       m_make_unreadable;
+	// NoteGpuWrite's scratch: the hot pages of the written range.
+	std::vector<std::pair<uint64_t, HotPage*>> m_hot_written;
 	// SynchronizeBda's scratch: the taken ranges, the buffer parts to synchronize, their buffers,
 	// and the copies of their CPU-modified pages with the index of the part each belongs to.
 	BdaSyncDue                  m_bda_due;
@@ -473,6 +475,8 @@ private:
 	};
 	std::mutex             m_published_mutex;
 	std::vector<Published> m_published;
+	// DrainPublished's scratch (GPU thread).
+	std::vector<Published> m_published_drained;
 	// Whether m_published holds anything: DrainPublished asks this before it takes the lock.
 	std::atomic<bool>      m_published_pending {false};
 	struct WatchedRange {

@@ -32,7 +32,8 @@ public:
 	void               SetGpuModifiedReadable(uint64_t vaddr, uint64_t size, bool readable);
 	// The same for each of several pages of `page_size` bytes (ascending, none crossing a
 	// tracking region): one lock and one protection update per region instead of per page.
-	void SetGpuModifiedReadable(std::span<const uint64_t> pages, uint64_t page_size, bool readable);
+	// Returns the pages it changed (RegionManager::SetStaleReadable).
+	size_t SetGpuModifiedReadable(std::span<const uint64_t> pages, uint64_t page_size, bool readable);
 	[[nodiscard]] bool IsGpuModifiedReadable(uint64_t vaddr, uint64_t size);
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
