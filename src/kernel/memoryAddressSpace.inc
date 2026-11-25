@@ -800,9 +800,30 @@ private:
 
 	bool ProtectMappedUnlocked(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 		const auto end = vaddr + size;
-		auto       it  = m_mapped.upper_bound(vaddr);
+		// The mapping this thread's last call found, until the mappings change (they change under
+		// the lock the caller holds, exclusively): a range inside it is protected as the walk
+		// below would protect it, which finds that mapping and only it, without the walk of the
+		// tree of some thousands of mappings. The GPU thread's trackers ask for about a thousand
+		// protections a frame, mostly of pages in the mapping they asked for last.
+		struct LastMapped {
+			const void* space      = nullptr;
+			uint64_t    generation = 0;
+			uint64_t    begin      = 0;
+			uint64_t    end        = 0;
+		};
+		thread_local LastMapped last;
+		const auto generation = m_mapped_generation.load(std::memory_order_relaxed);
+		if (size != 0 && last.space == this && last.generation == generation &&
+		    vaddr >= last.begin && end <= last.end) {
+			return VirtualMemory::Protect(vaddr, size, mode);
+		}
+		auto it = m_mapped.upper_bound(vaddr);
 		if (it != m_mapped.begin()) {
 			--it;
+		}
+		if (size != 0 && it != m_mapped.end() && it->second.vaddr <= vaddr &&
+		    end <= it->second.vaddr + it->second.size) {
+			last = {this, generation, it->second.vaddr, it->second.vaddr + it->second.size};
 		}
 		for (; it != m_mapped.end() && it->second.vaddr < end; ++it) {
 			const auto& region      = it->second;
