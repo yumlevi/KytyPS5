@@ -376,6 +376,13 @@ static vk::Format StorageViewFormat(const ShaderRecompiler::IR::ImageResource& r
 
 // Whether a T# of `type` can be viewed with the dimension a shader declares: the image is
 // created with the T#'s type and the view with the shader's.
+namespace {
+// 1: a bindless key whose T# is of a 32-bit integer format gets that texture, through the float
+// view that keeps its texels' bits (ResolveTexture); 0: the placeholder, as before.
+Common::LiveControl::Switch  g_bindless_bits("bindless_bits", 1);
+Common::LiveControl::Counter g_bindless_bits_views("bindless_bits_views");
+} // namespace
+
 static bool TextureTypeFitsDimension(Prospero::ImageType                       type,
                                      ShaderRecompiler::Decoder::ImageDimension dimension) {
 	using Dimension = ShaderRecompiler::Decoder::ImageDimension;
@@ -635,9 +642,29 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	// view that keeps the texels' bits, and the shader takes the integers from what that view
 	// gives (IR::RawClassImage, IR::RawViewOf).
 	// A depth or stencil surface has no colour view, and never reaches such an image.
-	const auto raw_view = ShaderRecompiler::IR::RawClassImage(resource) && !depth_tile
-	                          ? ShaderRecompiler::IR::RawViewOf(format)
-	                          : ShaderRecompiler::IR::RawViewInfo {};
+	auto raw_view = ShaderRecompiler::IR::RawClassImage(resource) && !depth_tile
+	                    ? ShaderRecompiler::IR::RawViewOf(format)
+	                    : ShaderRecompiler::IR::RawViewInfo {};
+	// A bindless image has one declaration for every T# its keys name, and that is a float one:
+	// the module was made before any of them was read. A T# of a 32-bit integer format is still
+	// that image's to load: through the float view of the same width a texel load gives the
+	// integer's bits, which is what the registers of the guest's load hold. (Saros reads the
+	// R32_UINT page tables of its sparse volume textures this way, with keys into its table of
+	// all textures. Refused for their numeric class, they were the placeholder: every page read
+	// as page 0, and each such volume was drawn as a box of whatever the atlas holds there.)
+	// Only the stored channels come out right: a channel the T# sets to one reads as the bits of
+	// 1.0f through this view, not as the integer 1 (a raw-class image has a word of shader data
+	// to put that right; a bindless image has none per key). The page tables are read by .x.
+	if (optional && resource.bindless && !depth_tile && !resource.depth_compare &&
+	    raw_view.mode == ShaderRecompiler::IR::RawView::None &&
+	    resource.numeric_class == Prospero::TextureNumericClass::Float &&
+	    resource.conversion_format == Prospero::BufferFormat::kInvalid && g_bindless_bits.On()) {
+		if (const auto bits = ShaderRecompiler::IR::RawViewOf(format);
+		    bits.mode == ShaderRecompiler::IR::RawView::Bits) {
+			raw_view = bits;
+			g_bindless_bits_views.Add();
+		}
+	}
 	const bool raw      = raw_view.mode != ShaderRecompiler::IR::RawView::None;
 	const bool sampled_numeric_class =
 	    storage || raw ||
