@@ -1245,12 +1245,23 @@ std::optional<uint64_t> TextureCache::TakeWrittenBack(const GuestRange& range) {
 	return tick;
 }
 
+// What the look for a colour image's fast-clear state does, a frame: the calls for an image with
+// such metadata, those whose metadata the GPU had written and that left the choice of the clear
+// to the GPU, those that read the metadata back on the host instead (a wait for the GPU), the
+// slices compared byte by byte with their clear code, and the slices cleared.
+static Common::LiveControl::Counter g_color_clear_calls("color_clear_calls");
+static Common::LiveControl::Counter g_color_clear_gpu_checks("color_clear_gpu_checks");
+static Common::LiveControl::Counter g_color_clear_host_reads("color_clear_host_reads");
+static Common::LiveControl::Counter g_color_clear_slice_reads("color_clear_slice_reads");
+static Common::LiveControl::Counter g_color_clear_cpu_clears("color_clear_cpu_clears");
+
 void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
                                        uint32_t metadata_base_layer) {
 	if (desc.info.metadata.kind != ImageMetadataKind::Dcc &&
 	    desc.info.metadata.kind != ImageMetadataKind::Cmask) {
 		return;
 	}
+	g_color_clear_calls.Add();
 	const auto  range = desc.info.metadata.range;
 	const auto& view  = desc.view_info;
 	{
@@ -1347,6 +1358,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			     native_current)) {
 				// The GPU selects each slice's clear, so the CPU never waits for the metadata.
 				Common::DebugCounters::Add(Common::DebugCounters::Counter::ColorMetadataChecks);
+				g_color_clear_gpu_checks.Add();
 				InitializeImage(id);
 				const bool expand = desc.type != BindingType::VideoOut;
 				const auto [buffer, offset] =
@@ -1388,6 +1400,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		    Common::DebugCounters::Counter::ColorMetadataReadbackNs);
 		const Common::GpuTiming::SyncScope sync_reason(
 		    Common::GpuTiming::SyncReason::MetadataCheck);
+		g_color_clear_host_reads.Add();
 		m_buffer_cache.ReadMemory(viewed.address, viewed.size, false);
 		m_buffer_cache.NoteWatchedRead(range.address, range.size, true);
 		metadata_written = true;
@@ -1426,6 +1439,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		if (!DecodeColorClear(desc, code, clear.color)) {
 			continue;
 		}
+		g_color_clear_slice_reads.Add();
 		std::array<uint8_t, MetadataBlockSize> block;
 		std::array<uint8_t, MetadataBlockSize> codes;
 		codes.fill(code);
@@ -1440,6 +1454,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		if (!uniform) {
 			continue;
 		}
+		g_color_clear_cpu_clears.Add();
 		{
 			std::scoped_lock lock {m_lock};
 			const auto& image = m_slot_images[id];

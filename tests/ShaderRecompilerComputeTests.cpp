@@ -8150,9 +8150,17 @@ public:
       return cache.WatchedWriteSequence(ranges[i].first, ranges[i].second);
     };
     (void)cache.ConsumeWatchedWritePending();
+    // A range nobody has read on the host asks for no early submission.
+    (void)cache.ObtainBuffer(base + 5 * page + 64, 64, true);
+    Require(name, "never read",
+            sequence(1) != 0 && !cache.ConsumeWatchedWritePending(),
+            "a write to a range never read on the host asked for an early "
+            "submission or did not advance its sequence");
+    const auto unread = sequence(1);
+    cache.NoteWatchedRead(ranges[1].first, ranges[1].second, true);
     (void)cache.ObtainBuffer(base + 5 * page + 64, 64, true);
     Require(name, "GPU write",
-            sequence(1) != 0 && sequence(0) == 0 && sequence(2) == 0 &&
+            sequence(1) > unread && sequence(0) == 0 && sequence(2) == 0 &&
                 cache.ConsumeWatchedWritePending(),
             "a GPU write did not advance exactly the range it overlaps");
     const auto large = sequence(1);

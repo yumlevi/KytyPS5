@@ -674,9 +674,10 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		}
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
-	// The guest clears color metadata with compute; the texture cache reads the clear code
-	// back on the next bind of the target. Submitting now keeps that readback a short copy
-	// instead of a flush of everything recorded since.
+	// The guest clears color metadata with compute. Where the texture cache read such a range's
+	// clear code back on the host the last time (it lets the GPU choose the clear when it can,
+	// and then reads nothing), it will again on the next bind of the target: submitting now
+	// keeps that readback a short copy instead of a flush of everything recorded since.
 	if (m_context.GetBufferCache().ConsumeWatchedWritePending()) {
 		const Common::GpuTiming::SyncScope sync_reason(
 		    Common::GpuTiming::SyncReason::MetadataCheck);
@@ -739,9 +740,10 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	buffer.BindComputePipeline(pipeline.pipeline);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
-	// The guest clears color metadata with compute; the texture cache reads the clear code
-	// back on the next bind of the target. Submitting now keeps that readback a short copy
-	// instead of a flush of everything recorded since.
+	// The guest clears color metadata with compute. Where the texture cache read such a range's
+	// clear code back on the host the last time (it lets the GPU choose the clear when it can,
+	// and then reads nothing), it will again on the next bind of the target: submitting now
+	// keeps that readback a short copy instead of a flush of everything recorded since.
 	if (m_context.GetBufferCache().ConsumeWatchedWritePending()) {
 		const Common::GpuTiming::SyncScope sync_reason(
 		    Common::GpuTiming::SyncReason::MetadataCheck);

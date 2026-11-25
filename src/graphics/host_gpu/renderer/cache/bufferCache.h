@@ -161,7 +161,10 @@ public:
 	void NoteHostWrite(uint64_t vaddr, uint64_t size);
 	// How the consumer of the watched range [vaddr, vaddr + size) read it last: on the host (a
 	// readback, which waits for every pending writer) or on the GPU (a check the GPU evaluates
-	// itself). A range counts as read on the host until its consumer reports otherwise.
+	// itself). A range counts as read on the GPU until its consumer reports a read on the host:
+	// its first host read then waits for whatever was recorded, once, where every writer of a
+	// range that only the GPU ever checks used to end the command buffer for nothing (314
+	// submissions a second in Saros, six a frame, counted as "metadata").
 	void NoteWatchedRead(uint64_t vaddr, uint64_t size, bool on_host);
 	// Whether a watched range read on the host was bound for GPU writing since the last call:
 	// the host reads such a range soon (a clear code), and a readback of a pending writer
@@ -484,7 +487,7 @@ private:
 		uint64_t size;
 		uint64_t sequence;
 		// The consumer read the range on the host the last time (NoteWatchedRead).
-		bool read_on_host = true;
+		bool read_on_host = false;
 	};
 	// Sorted by address; no range is larger than m_watched_max_size.
 	std::vector<WatchedRange>                         m_watched_ranges;
