@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cinttypes>
 #include <cstring>
 #include <limits>
@@ -328,7 +329,7 @@ void TextureCache::DeleteImage(ImageId id) {
 	} else {
 		// Detach first: deleting each association also unlinks it from its depth owner.
 		for (const auto association: std::exchange(image.stencil_ids, {})) {
-			FreeImage(association);
+			FreeImage(association, "its depth image was freed");
 		}
 	}
 	m_download_images.erase(id);
@@ -354,7 +355,19 @@ void TextureCache::DeleteImage(ImageId id) {
 	}
 }
 
-void TextureCache::FreeImage(ImageId id) {
+// 1: a line for each image freed while the image heap still selects it (ImageHeap finds its
+// element changed and looks the image up again): the image and why it was freed.
+static Common::LiveControl::Switch g_image_free_log("image_free_log", 0);
+
+void TextureCache::FreeImage(ImageId id, const char* why) {
+	if (g_image_free_log.On()) {
+		const auto& image = m_slot_images[id];
+		if (const auto references = image.heap_refs.load(std::memory_order_relaxed); references != 0u) {
+			LOGF("Image freed: 0x%" PRIx64 "+0x%" PRIx64 " %ux%u, %u heap references: %s\n",
+			     image.info.data.address, image.info.data.size, image.info.extent.width,
+			     image.info.extent.height, references, why);
+		}
+	}
 	m_slot_images[id].ClearGpuModified();
 	DeleteImage(id);
 }
@@ -680,6 +693,15 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	}
 }
 
+// An image made anew because memory is used as depth by one binding and as colour by another
+// (ResolveDepthOverlap), a frame: the times, by what asked (a texture that reads depth bytes
+// through a colour format, a depth target over the colour copy, anything else), and what
+// making the image, the copy into it and freeing the old one took.
+static Common::LiveControl::Counter g_depth_recreate_texture("depth_recreate_texture");
+static Common::LiveControl::Counter g_depth_recreate_target("depth_recreate_target");
+static Common::LiveControl::Counter g_depth_recreate_other("depth_recreate_other");
+static Common::LiveControl::Counter g_depth_recreate_us("depth_recreate_us");
+
 ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
                                           ImageId cached_id) {
 	auto& cached = m_slot_images[cached_id];
@@ -738,6 +760,11 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	if (!recreate) {
 		return cached_id;
 	}
+	(binding == BindingType::Texture       ? g_depth_recreate_texture
+	 : binding == BindingType::DepthTarget ? g_depth_recreate_target
+	                                       : g_depth_recreate_other)
+	    .Add();
+	const auto recreate_begin = std::chrono::steady_clock::now();
 	RefreshImage(cached_id);
 	auto info = requested;
 	if (retain_cached_layout) {
@@ -786,7 +813,11 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		           "TextureCache: unsupported unequal-sample depth overlap copy (%u -> %u)\n",
 		           cached.backing.samples, replacement.backing.samples);
 	}
-	FreeImage(cached_id);
+	FreeImage(cached_id, "a depth image over it");
+	g_depth_recreate_us.Add(static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+	                                                          recreate_begin)
+	        .count()));
 	return replacement_id;
 }
 
@@ -847,7 +878,7 @@ void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) {
 		}
 	}
 	cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
-	cache.FreeImage(cached_id);
+	cache.FreeImage(cached_id, "merged into another image");
 }
 
 } // namespace BcAlias
@@ -914,7 +945,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			                        left.surface_z == right.surface_z;
 		                 }))) {
 			if (safe_to_delete) {
-				FreeImage(cached_id);
+				FreeImage(cached_id, "an overlapping image takes its place (1)");
 			} else if (displaceable) {
 				MarkDisplaced(cached_id);
 			}
@@ -1007,12 +1038,12 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		m_slot_images[merged_id].binding.is_target |= cached.binding.is_target;
 		CopyImageMip(merged_id, cached_id, static_cast<uint32_t>(mip),
 		             static_cast<uint32_t>(layer));
-		FreeImage(cached_id);
+		FreeImage(cached_id, "copied into the image that overlaps it");
 		return {merged_id};
 	}
 	if (requested.data.address >= cached.info.data.address) {
 		if (safe_to_delete) {
-			FreeImage(cached_id);
+			FreeImage(cached_id, "an overlapping image takes its place (2)");
 		} else if (displaceable) {
 			MarkDisplaced(cached_id);
 		}
@@ -1058,7 +1089,7 @@ void TextureCache::ReleaseDisplaced(bool pressured) {
 		if (pressured && m_total_used_memory >= m_pressure_gc_memory && !image->depth_id &&
 		    FramesUnused(*image) > NumFramesBeforePressureRemoval && !HoldsGpuContents(*image) &&
 		    image->heap_refs.load(std::memory_order_relaxed) == 0u) {
-			FreeImage(id);
+			FreeImage(id, "displaced, under memory pressure");
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
 			continue;
 		}
@@ -1084,7 +1115,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	} else {
 		CopyImage(expanded_id, source_id);
 	}
-	FreeImage(source_id);
+	FreeImage(source_id, "expanded into a larger image");
 	return expanded_id;
 }
 
@@ -1705,7 +1736,7 @@ ImageId TextureCache::LookupImage(ImageDesc& desc, bool exact_format, bool* sole
 			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
 				result = {};
 			} else if (!resolved.info.resources.Covers(desc.info.resources)) {
-				FreeImage(result);
+				FreeImage(result, "a lookup wants more levels or layers");
 				result = {};
 			}
 		}
@@ -2783,7 +2814,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		if (owner == nullptr) {
 			continue;
 		}
-		FreeImage(id);
+		FreeImage(id, "its memory was unmapped");
 	}
 }
 
@@ -2818,7 +2849,7 @@ void TextureCache::RunGarbageCollector() {
 		m_lru_cache.ForEachItemBelow(tick - age, [&](ImageId id) { candidates.push_back(id); });
 		const auto evict = [&](ImageId id) {
 			--deletions;
-			FreeImage(id);
+			FreeImage(id, "collected, unused");
 			evicted++;
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
@@ -2934,7 +2965,7 @@ size_t TextureCache::CollectOverLimit(uint64_t tick, uint64_t limit) {
 			}
 			continue;
 		}
-		FreeImage(id);
+		FreeImage(id, "collected, over the limit (1)");
 		evicted++;
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
 	}
@@ -2955,7 +2986,7 @@ size_t TextureCache::CollectOverLimit(uint64_t tick, uint64_t limit) {
 			continue;
 		}
 		written += size;
-		FreeImage(id);
+		FreeImage(id, "collected, over the limit (2)");
 		evicted++;
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
 	}

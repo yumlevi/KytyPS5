@@ -273,7 +273,7 @@ private:
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
 	void                      DeleteImage(ImageId id);
-	void                      FreeImage(ImageId id);
+	void                      FreeImage(ImageId id, const char* why = "");
 	void                      TouchImage(Image& image);
 	// Keeps an image an overlapping image displaced (Image::displaced).
 	void MarkDisplaced(ImageId id);
