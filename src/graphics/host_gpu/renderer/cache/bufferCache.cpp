@@ -228,6 +228,27 @@ Common::LiveControl::Counter g_store_ahead_windows("store_ahead_windows");
 // uploaded again), and one pass of requests takes MaxPassWindowBytes of them at most (its
 // publications lie in the download ring until the pass has waited).
 Common::LiveControl::Switch  g_store_ahead_gpu("store_ahead_gpu", 1023);
+// With the GPU caught up, what a store's window is of what its thread asked for
+// (store_free_factor), and the fewest GPU-written pages in a row ahead of the store that go by
+// the download and not by the thread's copy (store_gpu_min). A window by the download costs
+// about 110 us and 0.3 us a KiB on top (180 us on average at a quarter megabyte, 410 to 600
+// at a megabyte and a half), a copy 11 us a KiB: from a few pages on the download is the
+// cheaper one, and the thread asks for few (its windows double from two pages, and most runs
+// end, or are another thread's from there on, before they reach thirty). 1 and 64: only what
+// a copy cannot take, as when the windows came.
+//
+// With that, the frames in which a dozen of the game's threads fill a block at once (60 to
+// 150 ms, 8 to 15 of them in two minutes of a session) are gone: the first thread's window
+// brings the pages the others were about to fault on. What still goes through the mapping
+// (850 MiB of 1,000 in that session) is asked for while the GPU works, in frames that are
+// not waiting for it.
+Common::LiveControl::Switch  g_store_free_factor("store_free_factor", 8);
+Common::LiveControl::Switch  g_store_gpu_min("store_gpu_min", 16);
+// Passes that held a store with pages ahead: with the GPU caught up, with its last submission
+// still running, and with that finished but commands recorded for the next.
+Common::LiveControl::Counter g_store_runs_free("store_runs_free");
+Common::LiveControl::Counter g_store_runs_busy("store_runs_busy");
+Common::LiveControl::Counter g_store_runs_recording("store_runs_recording");
 Common::LiveControl::Counter g_store_gpu_windows("store_gpu_windows");
 // What such windows brought, and the passes that held one, from their first request to the
 // last hand-over (the copy, the wait for the GPU, the publication, the pages' protection).
@@ -1098,17 +1119,20 @@ void BufferCache::ServeGuestReadbacks(std::span<const GuestReadback> requests) {
 	std::vector<Served>                          served(requests.size());
 	std::vector<Common::UniqueFunction<void>>    publications;
 	std::optional<Common::GpuTiming::SyncReason> submit_reason;
-	// What the requester's own copy takes of a store's pages ahead, and whether the download
-	// may take more in this pass (see store_ahead_gpu): asked before anything is recorded here.
+	// What the requester's own copy takes of a store's pages ahead, what the download takes, and
+	// whether it may take a window in this pass (see store_ahead_gpu): asked before anything
+	// is recorded here.
 	const auto copy_most   = uint64_t {g_store_ahead.Get()} * TRACKER_PAGE_SIZE;
+	const auto window_most = uint64_t {g_store_ahead_gpu.Get()} * TRACKER_PAGE_SIZE;
 	bool       gpu_free    = false;
 	uint64_t   window_room = MaxPassWindowBytes;
 	uint64_t   windows     = 0;
-	if (g_store_ahead_gpu.On() && std::ranges::any_of(requests, [](const GuestReadback& request) {
+	if (window_most != 0 && std::ranges::any_of(requests, [](const GuestReadback& request) {
 		    return request.ahead != 0 && request.handoff != nullptr;
 	    })) {
-		gpu_free = m_scheduler.IsFree(m_scheduler.CurrentTick() - 1) &&
-		           !m_scheduler.Current().HasCommands();
+		const bool finished = m_scheduler.IsFree(m_scheduler.CurrentTick() - 1);
+		gpu_free            = finished && !m_scheduler.Current().HasCommands();
+		(gpu_free ? g_store_runs_free : finished ? g_store_runs_recording : g_store_runs_busy).Add();
 	}
 	const auto pass_begin = gpu_free ? std::chrono::steady_clock::now()
 	                                 : std::chrono::steady_clock::time_point {};
@@ -1141,8 +1165,14 @@ void BufferCache::ServeGuestReadbacks(std::span<const GuestReadback> requests) {
 		DrainPublished();
 		const auto buffer_id = FindBuffer(result.base, result.size);
 		auto&      buffer    = m_slot_buffers[buffer_id];
-		// The end of the window that is a store's pages ahead (StoreAhead).
-		uint64_t ahead_bytes = 0;
+		// The end of the window that is a store's pages ahead (StoreAhead), and whether the
+		// download brings it.
+		uint64_t   ahead_bytes = 0;
+		bool       window      = false;
+		const auto by_download = [&](uint64_t bytes) {
+			return gpu_free && bytes <= window_room && !buffer.gpu_write_open &&
+			       buffer.gpu_write_tick < m_scheduler.CurrentTick();
+		};
 		if (IsRegionGpuModified(result.base, result.size)) {
 			// GPU-modified ranges come as many small scattered islands, so a readback widens to
 			// a window of its buffer (a fault read: the window around the faulting byte).
@@ -1171,18 +1201,27 @@ void BufferCache::ServeGuestReadbacks(std::span<const GuestReadback> requests) {
 			if (request.kind == GuestReadback::Kind::Write && request.ahead != 0 &&
 			    request.handoff != nullptr) {
 				// A store that runs on through GPU-written pages: those after its own, as far
-				// as the buffer goes (StoreAhead). For the requester's own copy or the
-				// download, see below.
-				const auto own_end = end;
-				end = std::max(end, std::min(Common::AlignUp(wanted_end, TRACKER_PAGE_SIZE) +
-				                                 request.ahead,
-				                             buffer.CpuAddress() + buffer.Size()));
-				if (end - own_end > copy_most) {
-					// More than a copy takes, which only the download brings: it ends with the
-					// run of GPU-written pages the store walks into. (What a copy takes stays,
-					// whatever lies in it: the copy reads the dirty bytes alone.)
-					end = std::max(std::min(end, GpuWrittenRunEnd(own_end, end)),
-					               own_end + copy_most);
+				// as the buffer goes (StoreAhead). With the requester's own copy that is what
+				// the thread asked for, at most what a copy takes, whatever lies in it (the
+				// copy reads the dirty bytes alone).
+				const auto own_end    = end;
+				const auto ahead_base = Common::AlignUp(wanted_end, TRACKER_PAGE_SIZE);
+				const auto buffer_end = buffer.CpuAddress() + buffer.Size();
+				end = std::max(end, std::min(ahead_base + std::min(request.ahead, copy_most),
+				                             buffer_end));
+				if (by_download(0)) {
+					// With the download (see store_ahead_gpu): a multiple of what was asked for,
+					// as far as the run of GPU-written pages goes that the store walks into,
+					// when that is worth a submission.
+					const auto most  = std::min(request.ahead * std::max(g_store_free_factor.Get(), 1u),
+					                            window_most);
+					const auto limit = std::max(end, std::min(ahead_base + most, buffer_end));
+					const auto run   = std::min(limit, GpuWrittenRunEnd(own_end, limit));
+					if (run >= own_end + uint64_t {std::max(g_store_gpu_min.Get(), 1u)} * TRACKER_PAGE_SIZE &&
+					    by_download(run - start)) {
+						end    = run;
+						window = true;
+					}
 				}
 				ahead_bytes = end - own_end;
 			}
@@ -1261,31 +1300,17 @@ void BufferCache::ServeGuestReadbacks(std::span<const GuestReadback> requests) {
 			     submitted == 0 ? "none" : m_scheduler.IsFree(submitted) ? "done" : "running");
 		}
 		// The pages ahead of a store are a guess about memory other threads store into as
-		// well. They come with the requester's copy when it takes the window, or with the
-		// download: for a window larger than a copy takes, or one the copy cannot be handed
-		// (a buffer without a mapping), while the GPU has caught up and the buffer's last
-		// write is submitted, as the copy asks. Otherwise the window is what a copy takes
-		// and, without that copy, the request's own pages, as it was before there were
-		// pages ahead.
-		bool       handed      = false;
-		bool       window      = false;
-		const auto by_download = [&] {
-			return gpu_free && result.size <= window_room && !buffer.gpu_write_open &&
-			       buffer.gpu_write_tick < m_scheduler.CurrentTick();
-		};
-		if (ahead_bytes > copy_most) {
-			if (by_download()) {
-				window = true;
-			} else {
-				result.size -= ahead_bytes - copy_most;
-				ahead_bytes  = copy_most;
-			}
-		}
+		// well. They come with the download where that was chosen above, else with the
+		// requester's copy when it takes the window; a window the copy cannot be handed (a
+		// buffer without a mapping) goes to the download as well while the GPU has caught
+		// up and the buffer's last write is submitted, as the copy asks. Otherwise the
+		// request is its own pages, as it was before there were pages ahead.
+		bool handed = false;
 		if (!window) {
 			handed = request.handoff != nullptr &&
 			         HandOffGuestCopy(request, buffer, buffer_id, result.base, result.size);
 			if (!handed && ahead_bytes != 0) {
-				if (by_download()) {
+				if (by_download(result.size)) {
 					window = true;
 				} else {
 					result.size -= ahead_bytes;
@@ -1305,12 +1330,9 @@ void BufferCache::ServeGuestReadbacks(std::span<const GuestReadback> requests) {
 			continue;
 		}
 		AwaitSubmittedDownloads(result.base, result.size);
-		if (window) {
-			// (Not read in place: the pages the publication writes are handed over below.)
-			result.window = true;
-			window_room  -= result.size;
-			windows++;
-		} else if (ReadBackInPlace(buffer, result.base, result.size)) {
+		// (A window is not read in place: the pages its publication writes are handed over
+		// below.)
+		if (!window && ReadBackInPlace(buffer, result.base, result.size)) {
 			// Published already: only the tracker state below remains.
 			result.copied = true;
 			Common::GpuTiming::Sync().AddInPlaceReadback();
@@ -1318,6 +1340,11 @@ void BufferCache::ServeGuestReadbacks(std::span<const GuestReadback> requests) {
 		}
 		result.copied = DownloadBufferMemory<false>(buffer, result.base, result.size, &publications,
 		                                            window ? &result.written : nullptr);
+		if (window && result.copied) {
+			result.window = true;
+			window_room  -= std::min(window_room, result.size);
+			windows++;
+		}
 		if (result.copied) {
 			if (submit_reason) {
 				// Rides the submission of an earlier request of the batch.
