@@ -3,6 +3,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/gpuTiming.h"
+#include "common/liveControl.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -24,6 +25,11 @@
 namespace Libs::Graphics {
 
 namespace {
+
+// What ReadMapped read in calls of 4 KiB or more and how long that took: read_mapped_us over
+// read_mapped_kb is the microseconds a KiB of a buffer's mapping costs to read.
+Common::LiveControl::Counter g_read_mapped_kb("read_mapped_kb");
+Common::LiveControl::Counter g_read_mapped_us("read_mapped_us");
 
 // The buffers with a GPU address, and the last of them destroyed (DescribeGpuAddress).
 struct AddressedBuffer {
@@ -296,14 +302,32 @@ void Buffer::ReadMapped(uint64_t offset, uint64_t size, void* destination) const
 	const auto* source    = map_begin + offset;
 	const auto* finish    = source + size;
 	auto*       target    = static_cast<uint8_t*>(destination);
+	const auto timed  = size >= 4096;
+	const auto before = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+	const struct Count {
+		bool                                  timed;
+		std::chrono::steady_clock::time_point before;
+		uint64_t                              size;
+		~Count() {
+			if (timed) {
+				g_read_mapped_kb.Add(size >> 10u);
+				g_read_mapped_us.Add(static_cast<uint64_t>(
+				    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - before)
+				        .count()));
+			}
+		}
+	} count {timed, before, size};
 	// Streaming loads may be served from fill buffers that predate the GPU's write: the fence
 	// orders them after every earlier load and store, so they observe the completed write.
 	_mm_mfence();
 	// Every byte comes from a streaming load of its aligned 16-byte word, the bytes before the
 	// first aligned word and after the last one too: the GPU-written ranges read here are often
 	// islands shorter than a word, and a plain load of this (write-combined) memory costs a bus
-	// read of its own (~0.05 GB/s against ~1.5 GB/s). Only a word that is not wholly inside the
-	// mapping is read with plain loads.
+	// read of its own. Only a word that is not wholly inside the mapping is read with plain
+	// loads. (What it comes to in play, by read_mapped_us over read_mapped_kb in a session of
+	// Saros: 10.5 to 12.3 us a KiB, 80 to 93 MB/s, and about a gigabyte read that way in two and a
+	// half minutes. Reading whole lines through a small cached buffer, a block at a time, was
+	// slower: 17.7 to 19.7 us a KiB.)
 	while (source < finish) {
 		const auto* word = reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(source) &
 		                                                    ~uintptr_t {15});
