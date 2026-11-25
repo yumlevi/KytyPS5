@@ -191,6 +191,7 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 		    Libs::Graphics::WindowReplayPadButton(button, down);
 	    },
 	    .input_seconds = [] { return Libs::Graphics::WindowInputSeconds(); },
+	    .capture       = [] { Libs::Graphics::RenderDocRequestCapture(); },
 	});
 	// --unreal-cvar: the title's own settings, once it runs.
 	Libs::LibKernel::UnrealCvars::Start(Config::UnrealCvars());

@@ -1891,6 +1891,9 @@ void Execute(uint64_t id, const std::string& line) {
 			list += Format(" %s:%u=%.2fs", thread.name.c_str(), thread.tid, ThreadCpuSeconds(thread));
 		}
 		Answer(list);
+	} else if (command == "capture" && g_hooks.capture != nullptr) {
+		g_hooks.capture();
+		Answer(Format("LIVE capture id=%" PRIu64, id));
 	} else if (command == "quit" && g_hooks.quit != nullptr) {
 		Answer(Format("LIVE quit id=%" PRIu64, id));
 		g_hooks.quit();

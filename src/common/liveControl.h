@@ -112,6 +112,9 @@ struct HostHooks {
 	void (*replay_button)(int button, bool down) = nullptr;
 	// The window's event clock in seconds: the time base of the log's input lines.
 	double (*input_seconds)() = nullptr;
+	// A RenderDoc capture of the next two guest flips, as the F1 key asks for one (`capture`;
+	// the session was started with --rd).
+	void (*capture)() = nullptr;
 };
 void SetHostHooks(const HostHooks& hooks) noexcept;
 
