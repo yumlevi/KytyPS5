@@ -493,6 +493,24 @@ unmodified `saros` branch gave 37 fps and the first batch of changes below 47.9.
   are now handled with one request per region, 933 to 591 requests a frame
   (`unreadable_merged`). With the item above, switched off and on six times in one played-back
   session: 15.13 to 14.64 ms of the thread's CPU time a frame.
+- **A dispatch that would wait for the GPU is put aside while the game's other queue has
+  work** (`suspend_readback`). Saros runs its GPU-driven culling in a compute queue: a pass
+  writes a count, the next dispatch needs it on the host, and so on, four times a frame right
+  after the frame's heaviest GPU work. The thread stopped at the first until the GPU had
+  caught up (up to 4.5 ms of a 19 ms frame) while the game's graphics queue had commands ready.
+  Such a dispatch is now suspended before it records anything, as a wait for a label is; its
+  bytes are sent for without a wait, the thread feeds the other queue, and the dispatch runs
+  again when the GPU has finished the submission the bytes come with. With nothing else to
+  run it waits as before, and it is never put aside twice for the same bytes. Waits 5.2 to 1.3
+  a frame, the thread's frame 18.5 to 17.7 ms, 53.7 to 55.6 fps (two whole played-back
+  sessions; the same in off/on windows inside one).
+- **A texture that changes takes its places in the resident texture table without a search of
+  the table.** Saros uses one block of memory as its depth buffer and, in a compute pass, as a
+  colour image; the image is made anew at each change of use, and the table's two entries for
+  it changed every frame. Finding the table places that pointed at them meant looking at all
+  198,000 of them, 0.4 ms a frame. Each texture now keeps a list of its places: 385 to 35 µs a
+  frame, 55.2 to 56.2 fps (`heap_slot_lists`; `heap_verify 1` checks the lists against the
+  full search in every frame, and a minute of play found no difference).
 - **A protection change inside the mapping a thread asked about last skips the search for it**
   among some thousands of mappings (from the DS fork).
 - **Command buffers are no longer ended early for colour metadata nobody reads on the CPU.** A
@@ -574,7 +592,8 @@ Most of the changes above can be turned off while the game runs, through the liv
 `hot_pages_max`, `store_ahead`, `store_ahead_gpu`, `store_free_factor`, `store_gpu_min`,
 `readback_ahead`, `unmap_precise`, `lock_sleep`, `publish_first`, `keep_marked`,
 `write_data_gpu`, `write_data_gpu_words`, `store_both`, `pop_no_wait`, `drain_runs`,
-`unreadable_merged`, `module_store`, `prepare_hold`, `background_ecores`. Each also reads an
+`unreadable_merged`, `module_store`, `prepare_hold`, `background_ecores`,
+`suspend_readback`, `heap_slot_lists`. Each also reads an
 environment variable `KYTY_<NAME>` at
 start. `present_crop` 1 to 9 shows a part of the picture pixel for pixel in the window.
 
@@ -691,12 +710,19 @@ start. `present_crop` 1 to 9 shows a part of the picture pixel for pixel in the 
   of memory its writers bind whole (0.1 ms); a second indirect dispatch (0.2 ms); and the
   graphics queue calls a 35 KiB command list the GPU wrote (0.3 ms). Removing one only moves
   the wait to the next, measured twice. The first four run in one of the game's compute queues
-  while its graphics queue has commands that could run: the next step is to put the waiting
-  command aside and feed the other queue until the bytes have arrived, as a wait for a label
-  already does.
+  while its graphics queue has commands that could run, and are now put aside for that queue
+  (see "A dispatch that would wait" above). What is left: the call of the GPU-written command
+  list, which now pays 1.1 ms a frame (the GPU is nine submissions behind there and no other
+  queue can run), and readbacks for the game's own threads that this thread still waits for
+  (0.3 ms a frame). The picture with the queues interleaved this way has been compared by
+  counters only, not yet by eye.
 - Time saved before those waits comes back as longer waits: an upload worker for the per-draw
   uploads (the DS fork's scope) cut that thread's copies and page protections by 5% of its
   time and changed no frame rate for that reason; it is not in.
+- A summary per 4 MiB tracking region, so that a buffer bound for reading over hundreds of MiB
+  skips the regions the game did not write, was built and reviewed: it answered 35,600 of the
+  40,400 region questions a frame with one load, and saved nothing that could be measured
+  (the question it replaces takes a few nanoseconds). Not in.
 - The DS fork's merged page protections are not ported: they join protections of adjacent
   pages that follow each other, of which Demon's Souls has about 110 a frame and Saros one.
 - Cards of 12 GB and less are not confirmed. With the rest of a 24 GB card taken away
