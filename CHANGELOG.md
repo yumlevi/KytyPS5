@@ -122,6 +122,22 @@ with them; other places and machines will differ.
   ahead of a store are fetched by the storing thread's own copy alone, at most 63 at a time
   (256 before), which gives back part of the gain above: 66 slow frames in the same restart
   and walk.
+- **The long frames of a level streaming in are mostly gone.** What a storing thread fetches
+  back comes out of video memory through a mapping, and that mapping gives the whole process
+  about 85 MB a second however many threads read it (measured in play: 10.5 to 12.3 µs a
+  KiB). A block of 4 MiB given to new data was 45 ms of the game's threads standing in their
+  stores, with nothing for the GPU thread to draw; when a dozen threads filled one block
+  together the frame took 60 to 150 ms. While the graphics card has nothing to do at that
+  moment, the GPU thread now brings such a window itself: one copy on the card into ordinary
+  memory (about 0.1 ms and 0.3 µs a KiB, a thirtieth of the mapping's price), written to the
+  pages that still wait for it, which are then handed to the game. A thread gets eight times
+  what it asked for that way, as far as the GPU-written pages go, so the first thread's
+  window brings what the others were about to ask for. A player's session of 137 seconds
+  played back three times each way (see "Tools for measuring"): frames over 50 ms 15–23
+  without it, 3–5 with it; frames in which many threads store at once and the picture
+  stands 8–15 to none; time lost to slow frames 1.24–1.60 s to 0.64–0.70 s; the 1% low
+  20.6–23.2 to 27.2–28.1 fps; the frame rate the same (`store_ahead_gpu`,
+  `store_free_factor`, `store_gpu_min`; `store_ahead_gpu 0` is the state before).
 - **Memory the game frees no longer stops the GPU thread until the GPU has finished
   everything** (the Demon's Souls and the Ghost of Yōtei forks found the same). An unmap of
   memory a cache knows waited for all GPU work in flight: 4 to 7 ms each time, in half of the
@@ -191,10 +207,10 @@ with them; other places and machines will differ.
 
 - **The game no longer reads old bytes from memory the GPU has written.** A page the game reads
   back every frame stays readable while the GPU writes it, and its new bytes are copied back
-  when the submission completes. Four paths let the game read the bytes of before the work
-  after it had been told the work was done; in Saros a worker thread took an index from such a
-  record and crashed the game (an access violation in the game's code, in 3 of 8 test runs of a
-  level within a minute):
+  when the submission completes. Six paths let the game read the bytes of before the work
+  after it had been told the work was done, or put older bytes over newer ones; in Saros a
+  worker thread took an index from such a record and crashed the game (an access violation in
+  the game's code, in 3 of 8 test runs of a level within a minute):
   - the mark that keeps a page readable stayed behind on neighbouring pages (since the
     publication fix of 2026-11-24 a copy-back cleans only the pages it holds bytes for), and a
     later GPU write of such a page left it readable with its old bytes for good;
@@ -203,7 +219,11 @@ with them; other places and machines will differ.
     runs before anything else queued for its submission (`publish_first 0` is the old order);
   - a readback that took over such a page's bytes delivered them behind the labels while the
     page stayed readable; and a page written twice in a row stayed readable for a moment after
-    the first write's bytes had been given up.
+    the first write's bytes had been given up;
+  - a copy-back made its pages readable before it wrote their bytes, so a thread that read at
+    that moment got the old ones (the bytes are written first now); and a page dropped from
+    the full set of such pages let a copy-back already on its way put its bytes over a GPU
+    write recorded after it. A review found these two; neither was seen to happen.
 - **Eight fixes of the Saros fork's `saros-v0.1.8` to `saros-v0.1.12` are taken over** (its author
   in turn took our lazy buffer synchronisation, the white flash fix and the readback work). Each
   is its own commit with his text:
@@ -428,6 +448,15 @@ unmodified `saros` branch gave 37 fps and the first batch of changes below 47.9.
   is left out wrongly, standing, turning or walking, and stills with it on and off do not
   differ. Most of the saved time comes back as waiting for the GPU: 50.0 to 51.3 fps in one
   session, 50.5 to 51.2 in another.
+- **A page that stays readable through a GPU write takes one protection change, not two.** The
+  pages the game reads back every frame stay readable while the GPU writes them. The write
+  was marked first, which took the page from the game, and the page was given back right
+  after: two requests to Windows that cancel, on the GPU thread, under the lock the game's
+  write faults wait for; with the set of 16,384 such pages about eight page changes for every
+  page delivered, every frame. Both states are now set in one update. A player's session
+  played back, one run each way: pages changed by the GPU thread 19,000–36,000 to
+  3,800–6,200 a frame, that thread's CPU time 17.8–18.3 to 16.7 ms a frame, 45.4–47.7 to
+  49.8 fps (`keep_marked`).
 - The GPU thread runs above the game's own threads.
 
 ### Readbacks (the game reading what the GPU wrote)
@@ -466,6 +495,11 @@ unmodified `saros` branch gave 37 fps and the first batch of changes below 47.9.
   `skip_empty_indirect` on against 0 of 26 with one or both off. That neither convicts nor
   clears them, the same loss was seen once before either existed, and neither makes a frame
   faster, so they wait for the cause.
+- **A store of the command stream over bytes the GPU wrote stays on the GPU** (`write_data_gpu`):
+  up to four words are filled into the buffer in the order of the commands instead of being
+  fetched back first. Saros does that with one word about every second frame; it made no
+  difference to a played-back session, because nearly all waits for a store are for the
+  game's own threads' stores.
 
 ### Textures
 
@@ -487,7 +521,9 @@ Most of the changes above can be turned off while the game runs, through the liv
 `vulkan_recording`, `bda_lazy`, `stream_share`, `heap_by_content`, `lookahead_replan`,
 `guest_image_writes`, `image_buffer_writes`, `guest_copy`, `readback_narrow`, `gpu_scalars`,
 `fault_ahead`, `game_upscaler`, `game_upscaler_skip`, `flip_when_done`, `hot_window`,
-`hot_pages_max`, `store_ahead`, `readback_ahead`, `unmap_precise`, `lock_sleep`. Each also reads an environment variable `KYTY_<NAME>` at
+`hot_pages_max`, `store_ahead`, `store_ahead_gpu`, `store_free_factor`, `store_gpu_min`,
+`readback_ahead`, `unmap_precise`, `lock_sleep`, `publish_first`, `keep_marked`,
+`write_data_gpu`. Each also reads an environment variable `KYTY_<NAME>` at
 start. `present_crop` 1 to 9 shows a part of the picture pixel for pixel in the window.
 
 ## Tools for measuring
@@ -546,6 +582,15 @@ start. `present_crop` 1 to 9 shows a part of the picture pixel for pixel in the 
   left readable or taken from the game, bytes copied back and by which way, faults, labels and
   flips delivered), and a fatal report lists them for the memory each register points to, with
   their times against the fault. For a game thread that crashed on a value it read too early.
+- **What a large buffer costs to make and to free**: a buffer of 64 MiB or more, or one that
+  takes 5 ms or more, writes a `BufferCache:` line when it is made (its memory, the buffers
+  copied into it, the rest) and when its memory is given back. Saros's heap grows 16 MiB at a
+  time, and each time the buffer over it (350 MiB and more) is made anew.
+- **What the mapping of video memory gives** (`read_mapped_kb`, `read_mapped_us` in the
+  performance log): 80 to 93 MB a second in a played session, about a gigabyte in two and a
+  half minutes; and `store_gpu_kb`, `store_gpu_us` for the same bytes brought by a copy on
+  the GPU. Counters under ten a frame are printed with three decimals, so what happens a few
+  times in a window can be counted from its line.
 - `readback_log` (live switch, for a few seconds) writes a line for every readback a game
   thread's read asks for and for every store of the GPU thread into GPU-written pages;
   `stale_readable 0` with the counter `early_reads` counts reads that arrive before the
