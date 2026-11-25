@@ -165,14 +165,25 @@ private:
 	void ReadBack(uint64_t address, uint64_t size) {
 		std::array<ScalarReadRange, MaxReadBacks + 1> batch {{{address, size}}};
 		size_t                                        count = 1;
-		for (const auto& range: m_prefetch) {
-			batch[count++] = range;
-		}
-		m_prefetch = {};
-		m_backend.ReadGpuDirtyBytes(std::span<const ScalarReadRange>(batch.data(), count));
 		if (m_read_back_count < MaxReadBacks) {
 			m_read_backs[m_read_back_count++] = {address, size};
 		}
+		for (const auto& range: m_prefetch) {
+			batch[count++] = range;
+			// A range of the walk before that holds GPU-written bytes now is read back here, so
+			// this walk will not ask for it itself: it stays on the list for the next walk. Kept
+			// by their own readbacks only, the ranges of a walk that reads several GPU-written
+			// tables were forgotten by every walk that waited once for them, and the walk after
+			// it waited once per table again. One that holds none any more is dropped: the GPU
+			// stopped writing it, or the walk stopped reading it and its bytes were taken by
+			// someone else.
+			if (range != ScalarReadRange {address, size} && m_read_back_count < MaxReadBacks &&
+			    m_backend.HasGpuDirtyBytes(range.first, range.second)) {
+				m_read_backs[m_read_back_count++] = range;
+			}
+		}
+		m_prefetch = {};
+		m_backend.ReadGpuDirtyBytes(std::span<const ScalarReadRange>(batch.data(), count));
 		for (auto& entry: m_entries) {
 			if (entry.dirty) {
 				entry.base  = UINT64_MAX;

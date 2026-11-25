@@ -236,7 +236,13 @@ void TestWalkReadBacksShareOneWait() {
           "a prefetched walk read stale values");
     Check(memory.readback_calls == 3,
           "the prefetched walk waited more than once");
+    // (As the renderer does: the next walk's hint is what this walk reports.)
+    const auto read_backs = walk.ReadBacks();
+    history.assign(read_backs.begin(), read_backs.end());
   }
+  Check(history == std::vector<Libs::Graphics::ScalarReadRange>{{first, 4},
+                                                                {second, 4}},
+        "a walk that waited once for two tables forgot the one it was handed");
   // Nothing dirty: the hint costs nothing.
   {
     Cache walk(memory);
@@ -257,6 +263,18 @@ void TestWalkReadBacksShareOneWait() {
   }
   Check(!memory.HasGpuDirtyBytes(second, 4),
         "the hinted table was not read back in the same round trip");
+  // A hinted table the GPU has stopped writing leaves the list.
+  memory.GpuWrite(first, 7);
+  {
+    Cache walk(memory);
+    walk.Prefetch(history);
+    Check(ReadWord(walk, first) == 7 && memory.readback_calls == 5,
+          "a walk whose other hinted table is clean");
+    const auto read_backs = walk.ReadBacks();
+    Check(read_backs.size() == 1 &&
+              read_backs[0] == Libs::Graphics::ScalarReadRange{first, 4},
+          "a hinted table without GPU-written bytes stayed on the list");
+  }
 }
 
 void TestUncachedAndUnmappedReads() {
