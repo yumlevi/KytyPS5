@@ -667,6 +667,8 @@ struct PipelineCache::ProgramCache {
 		size_t                                               next    = 0;
 		size_t                                               running = 0;
 		bool                                                 stop    = false;
+		// The threads of HurryPreparation go on while this holds.
+		bool                                                 hurry   = false;
 		PipelineCache::ProgramPreparationCounts              counts;
 		std::chrono::steady_clock::time_point                started;
 		std::vector<std::thread>                             threads;
@@ -880,10 +882,18 @@ struct PipelineCache::ProgramCache {
 		return prepared;
 	}
 
-	void PreparationWorker() {
-		Common::Thread::LowerCurrentThreadPriority();
-		if (g_background_ecores.On()) {
-			(void)Common::Thread::PinCurrentThreadToEfficiencyCpus();
+	// `hurried`: one of the threads the game's start waits for (HurryPreparation): at normal
+	// priority, on any core, and gone when the wait is over.
+	void PreparationWorker(bool hurried = false) {
+		if (!hurried) {
+			Common::Thread::LowerCurrentThreadPriority();
+			if (g_background_ecores.On()) {
+				(void)Common::Thread::PinCurrentThreadToEfficiencyCpus();
+			}
+			// One of them can be sampled (the live channel's "prof <seconds> prep").
+			if (static std::atomic<bool> named {false}; !named.exchange(true)) {
+				Common::LiveControl::RegisterThread("prep");
+			}
 		}
 		auto&            state = *preparation;
 		std::unique_lock lock(state.mutex);
@@ -893,6 +903,7 @@ struct PipelineCache::ProgramCache {
 				state.next++;
 			}
 			if (state.stop || state.next == state.jobs.size()) break;
+			if (hurried && !state.hurry) break;
 			const auto& job  = state.jobs[state.next++];
 			auto&       slot = state.slots.at(job.key);
 			slot.state       = Preparation::State::Running;
@@ -1018,6 +1029,29 @@ struct PipelineCache::ProgramCache {
 			return preparation->running == 0 &&
 			       (preparation->stop || preparation->next == preparation->jobs.size());
 		});
+	}
+
+	// The same for `timeout` at most; whether the preparation is over.
+	bool WaitForPreparation(std::chrono::milliseconds timeout) {
+		if (preparation == nullptr) return true;
+		std::unique_lock lock(preparation->mutex);
+		return preparation->changed.wait_for(lock, timeout, [&] {
+			return preparation->running == 0 &&
+			       (preparation->stop || preparation->next == preparation->jobs.size());
+		});
+	}
+
+	// `threads` more threads translate what is queued, at normal priority and on any core, until
+	// the queue is empty or the hurry is called off (false): for the wait of the game's first
+	// frame (RenderContext::HoldForPreparedPrograms).
+	void HurryPreparation(uint32_t threads) {
+		if (preparation == nullptr) return;
+		std::lock_guard lock(preparation->mutex);
+		preparation->hurry = threads != 0;
+		if (preparation->stop || preparation->next == preparation->jobs.size()) return;
+		for (uint32_t i = 0; i < threads; i++) {
+			preparation->threads.emplace_back([this] { PreparationWorker(true); });
+		}
 	}
 
 	// Takes the translation of the program `key` names, when one was prepared: waits for a
@@ -2774,6 +2808,14 @@ PipelineCache::ProgramPreparationCounts PipelineCache::GetProgramPreparationCoun
 
 void PipelineCache::WaitForProgramPreparation() {
 	m_program_cache->WaitForPreparation();
+}
+
+bool PipelineCache::WaitForProgramPreparation(std::chrono::milliseconds timeout) {
+	return m_program_cache->WaitForPreparation(timeout);
+}
+
+void PipelineCache::HurryProgramPreparation(uint32_t threads) {
+	m_program_cache->HurryPreparation(threads);
 }
 
 void PipelineCache::StopBackgroundCompiles() {

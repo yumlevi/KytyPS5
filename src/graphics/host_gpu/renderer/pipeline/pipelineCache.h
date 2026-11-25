@@ -210,6 +210,13 @@ public:
 		uint64_t missed  = 0;
 	};
 	[[nodiscard]] ProgramPreparationCounts GetProgramPreparationCounts() const;
+	// Waits for `timeout` at most until no recorded program is queued or being translated;
+	// whether that is so.
+	[[nodiscard]] bool WaitForProgramPreparation(std::chrono::milliseconds timeout);
+	// `threads` more threads, at normal priority and on any core, translate what is still queued,
+	// until nothing is or the hurry is called off (0): for a caller that holds the game back
+	// meanwhile.
+	void HurryProgramPreparation(uint32_t threads);
 	// The process is about to end on purpose: running precompile builds are recorded as
 	// interrupted (PrecompileAttempts::Interrupt), not as builds that ended the process, and
 	// builds that have not reached their driver call stop there.

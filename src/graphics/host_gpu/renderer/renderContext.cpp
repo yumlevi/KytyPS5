@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cinttypes>
 #include <cstring>
 #include <thread>
@@ -31,6 +32,21 @@ constexpr uint64_t SmallVideoMemory = 13ull << 30u;
 // 1: a guest unmap waits only for the completions that write its range (UnmapMemory); 0: for
 // everything the GPU still has to run, whenever a cache knows the memory.
 Common::LiveControl::Switch g_unmap_precise("unmap_precise", 1);
+
+// The longest the game's first submission waits for the programs that are translated ahead of
+// their first use (RenderContext::HoldForPreparedPrograms), in seconds; 0: it does not wait, and
+// the translations run beside the game, as before.
+//
+// A session translates every program an earlier one recorded and, where memory allows, every
+// compute shader of the game (Saros: 12,600 programs). Beside the game that takes the first
+// minute to minute and a half of play, during which the game runs a fifth slower (a replay of a
+// session, the first half minute in the level: 39 to 46 fps with the work going on, 48 to 56
+// without), wherever its threads are put and however many there are: the cost is the work. So
+// it is done before the game draws its first frame, with most of the host's threads: the game's
+// own start (loading its modules, its first files) runs meanwhile, and the window stays empty
+// that much longer: for Saros on a 13900K 22 s with the module store filled and 40 s with it
+// empty, as measured when this came (the translation was then limited by the heap).
+Common::LiveControl::Switch g_prepare_hold("prepare_hold", 90);
 
 } // namespace
 
@@ -83,6 +99,40 @@ RenderContext::RenderContext(GraphicContext& graphics)
 		    asked == UINT32_MAX ? std::clamp(std::thread::hardware_concurrency() / 4u, 2u, 8u)
 		                        : std::min(asked, 8u));
 	}
+}
+
+void RenderContext::HoldForPreparedPrograms() {
+	const auto limit = std::chrono::seconds {g_prepare_hold.Get()};
+	if (limit.count() == 0 || Config::PrecompileOnlyEnabled() ||
+	    m_pipeline_cache.WaitForProgramPreparation(std::chrono::milliseconds {0})) {
+		return;
+	}
+	// (The threads that are at it already stay; the game's own start needs a few.)
+	const auto host    = std::thread::hardware_concurrency();
+	const auto threads = host > 14u ? host - 12u : 2u;
+	const auto begin   = std::chrono::steady_clock::now();
+	const auto waited  = [&] {
+		return std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+	};
+	const auto before = m_pipeline_cache.GetProgramPreparationCounts();
+	LOGF("Programs prepared ahead: the game's first frame waits for them, %" PRIu64 " of %" PRIu64
+	     " done, %u more threads at it (prepare_hold: %" PRId64 " s at most)\n",
+	     before.prepared + before.failed, before.queued, threads,
+	     static_cast<int64_t>(limit.count()));
+	m_pipeline_cache.HurryProgramPreparation(threads);
+	bool done = false;
+	while (!(done = m_pipeline_cache.WaitForProgramPreparation(std::chrono::seconds {2})) &&
+	       waited() < static_cast<double>(limit.count())) {
+		const auto counts = m_pipeline_cache.GetProgramPreparationCounts();
+		LOGF("Programs prepared ahead: %" PRIu64 " of %" PRIu64 " after %.0f s\n",
+		     counts.prepared + counts.failed, counts.queued, waited());
+	}
+	m_pipeline_cache.HurryProgramPreparation(0);
+	const auto after = m_pipeline_cache.GetProgramPreparationCounts();
+	LOGF("Programs prepared ahead: the game's first frame waited %.1f s for %" PRIu64
+	     " programs%s\n",
+	     waited(), after.prepared + after.failed - (before.prepared + before.failed),
+	     done ? "" : "; the rest are translated beside the game");
 }
 
 RenderContext::~RenderContext() {

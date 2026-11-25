@@ -49,6 +49,10 @@ public:
 	void                                    ShutdownGpu();
 	[[nodiscard]] GuestGpu&                 GetGpu() const;
 	[[nodiscard]] VideoOut::VideoOutDriver& GetVideoOut() const;
+	// GPU thread, before the game's first submission: waits, for the seconds of the prepare_hold
+	// switch at most, until the programs that are translated ahead of their first use are, with
+	// most of the host's threads at it; nothing is left to translate beside the game then.
+	void HoldForPreparedPrograms();
 
 	Common::Mutex&      GetMutex() { return m_mutex; }
 	CommandScheduler&   GetCommandScheduler() { return m_command_scheduler; }

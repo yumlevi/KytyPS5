@@ -503,6 +503,7 @@ void GuestGpu::ThreadRun(void* data) {
 	}
 	g_gpu_state = gpu;
 
+	bool held_for_programs = false;
 	for (;;) {
 		Submission                   submission;
 		Common::UniqueFunction<void> command;
@@ -597,6 +598,12 @@ void GuestGpu::ThreadRun(void* data) {
 			continue;
 		}
 
+		if (!held_for_programs) {
+			// The game's first submission: the programs translated ahead of their first use
+			// are finished first, so that nothing is translated beside the game.
+			held_for_programs = true;
+			gpu->m_renderer.HoldForPreparedPrograms();
+		}
 		const auto writes   = gpu->m_memory_writes.load();
 		const bool complete = [&] {
 			Common::DebugCounters::ScopedTimer busy(
