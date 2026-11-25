@@ -478,7 +478,7 @@ if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 endif()
 
-set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus OpenXR::openxr_loader)
+set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus OpenXR::openxr_loader kyty_zstd)
 
 # Linux system libraries.
 if(LINUX)
@@ -902,6 +902,14 @@ add_executable(spirv_simplified_store_tests EXCLUDE_FROM_ALL
 target_link_libraries(spirv_simplified_store_tests xxhash)
 target_include_directories(spirv_simplified_store_tests PRIVATE ${inc_headers})
 
+add_executable(module_store_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ModuleStoreTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/moduleStore.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/CompiledInfoSerial.cpp"
+)
+target_link_libraries(module_store_tests common fmt::fmt xxhash kyty_zstd)
+target_include_directories(module_store_tests PRIVATE ${inc_headers})
+
 add_executable(driver_cache_history_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/DriverCacheHistoryTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/driverCacheFile.cpp"
@@ -1040,6 +1048,7 @@ if(BUILD_TESTING)
 	add_test(NAME driver_cache_file COMMAND $<TARGET_FILE:driver_cache_file_tests>)
 	add_test(NAME driver_cache_history COMMAND $<TARGET_FILE:driver_cache_history_tests>)
 	add_test(NAME spirv_simplified_store COMMAND $<TARGET_FILE:spirv_simplified_store_tests>)
+	add_test(NAME module_store COMMAND $<TARGET_FILE:module_store_tests>)
 	add_test(NAME memory_budget COMMAND $<TARGET_FILE:memory_budget_tests>)
 	add_test(NAME memory_priority COMMAND $<TARGET_FILE:memory_priority_tests>)
 	add_test(NAME subgroup_plan COMMAND $<TARGET_FILE:subgroup_plan_tests>)
@@ -1199,6 +1208,7 @@ if(BUILD_TESTING)
 		driver_cache_file_tests
 		driver_cache_history_tests
 		spirv_simplified_store_tests
+		module_store_tests
 		pending_draw_policy_tests
 		memory_priority_tests
 		subgroup_plan_tests

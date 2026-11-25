@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/renderer/pipeline/driverCacheFile.h"
 #include "graphics/host_gpu/renderer/pipeline/resourceLookahead.h"
 #include "graphics/host_gpu/renderer/pipeline/scalarReadCache.h"
+#include "graphics/host_gpu/renderer/pipeline/storedModules.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -327,6 +328,48 @@ ShaderRecompiler::Spirv::Profile HostShaderProfile(const GraphicContext& graphic
 	        .relaxed_float          = Config::RelaxedShaderFloatEnabled(),
 	        .ray_query              = graphics.ray_query_enabled,
 	        .driver_simplify        = !Config::ShaderSimplificationDisabled()};
+}
+
+// What changes a compiled module besides the arguments of its compilation (SetModuleStore): the
+// host's shader profile, the device values the stage inputs are derived from where the static
+// key of a stage leaves them out (they are one device's for a whole run), and the settings the
+// recompiler and its simplifier read from the environment.
+uint64_t ModuleVariant(const GraphicContext& graphics) {
+	const auto profile = HostShaderProfile(graphics);
+	// (Every field of the profile, by a binding that does not compile when it gains one.)
+	const auto& [maintenance8, native_float_min_max, ordered_float_min_max, device_clock_period_ps,
+	             robust_buffer_access, r8_srgb_views, r8g8_srgb_views, relaxed_float, ray_query,
+	             driver_simplify] = profile;
+	const auto& properties = graphics.GetPhysicalDeviceProperties();
+	const auto  env        = [](const char* name) {
+        const char* text = std::getenv(name);
+        return text != nullptr ? XXH3_64bits(text, std::strlen(text)) + 1u : uint64_t {0};
+	};
+	const std::array<uint64_t, 22> words = {
+	    maintenance8,
+	    native_float_min_max,
+	    ordered_float_min_max,
+	    device_clock_period_ps,
+	    robust_buffer_access,
+	    r8_srgb_views,
+	    r8g8_srgb_views,
+	    relaxed_float,
+	    ray_query,
+	    driver_simplify,
+	    graphics.ComputeHostSubgroupSize(),
+	    graphics.subgroup_size,
+	    properties.limits.maxComputeSharedMemorySize,
+	    properties.limits.maxViewportDimensions[0],
+	    properties.limits.maxViewportDimensions[1],
+	    properties.vendorID,
+	    properties.deviceID,
+	    graphics.maximal_reconvergence_enabled,
+	    ShaderRecompiler::Spirv::DriverSimplifyMinWords(),
+	    env("KYTY_LANE_LOCAL"),
+	    env("KYTY_NO_SPV_PEEPHOLE") ^ (env("KYTY_NO_SPV_CSE") << 1u),
+	    env("KYTY_NO_SPV_SINK"),
+	};
+	return XXH3_64bits(words.data(), sizeof(words));
 }
 
 bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
@@ -733,9 +776,9 @@ struct PipelineCache::ProgramCache {
 		options.dump_ir         = false;
 		options.early_dump      = false;
 		options.emit_debug_info = false;
-		const bool                                     first = prepared.permutations.empty();
-		std::optional<ShaderRecompiler::CompileResult> result;
-		auto                                           specialization = record.specialization;
+		const bool                   first = prepared.permutations.empty();
+		std::optional<StoredCompile> result;
+		auto                         specialization = record.specialization;
 		// (As the precompile built it: outside the simplification store.)
 		std::optional<ShaderRecompiler::Spirv::SimplifiedStoreBypass> unstored;
 		if (code_only) {
@@ -783,8 +826,12 @@ struct PipelineCache::ProgramCache {
 				}
 			}
 			if (plan_only) return true;
-			result = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization,
-			                                          record.push_data_cursor);
+			result = CompileThroughStore(std::move(translated), options, specialization,
+			                             record.push_data_cursor, *record.code,
+			                             [&](const std::vector<uint32_t>& spirv) {
+				                             return ValidateShaderSpirv(options.dump_label, key.hash,
+				                                                        spirv, profile.maintenance8);
+			                             });
 		} catch (const Common::RecoverableFatal& fatal) {
 			// (The precompile pass has said so for a created shader.)
 			if (!code_only) {
@@ -793,8 +840,7 @@ struct PipelineCache::ProgramCache {
 			}
 			return false;
 		}
-		if (!ValidateShaderSpirv(options.dump_label, key.hash, result->spirv,
-		                         profile.maintenance8)) {
+		if (result->invalid) {
 			return false;
 		}
 		const auto module = CompileSPV(result->spirv, graphics.device);
@@ -808,7 +854,7 @@ struct PipelineCache::ProgramCache {
 		    XXH3_64bits(result->spirv.data(), result->spirv.size() * sizeof(uint32_t));
 		prepared.permutations.push_back({
 		    .specialization = std::move(specialization),
-		    .program        = std::move(result->program).TakeCompiledInfo(),
+		    .program        = std::move(result->program),
 		    .handle         = {.module = module, .spirv_hash = spirv_hash},
 		    .spirv_hash     = spirv_hash,
 		    .code_only      = code_only,
@@ -1351,14 +1397,20 @@ struct PipelineCache::ProgramCache {
 	                               ShaderRecompiler::TranslateResult            translated,
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
 	                               uint32_t push_data_start_dword,
-	                               std::span<const uint32_t> function_code) {
+	                               std::span<const uint32_t> function_code,
+	                               std::span<const uint32_t> code) {
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::ShadersCompiled,
 		                                         Common::DebugCounters::Counter::ShaderCompileNs,
 		                                         Common::DebugCounters::Peak::ShaderCompileNs);
-		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
-		                                               specialization, push_data_start_dword);
-		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv,
-		                         options.profile->maintenance8)) {
+		// (`code`: the guest code the program was translated from, which names its module in
+		// the module store; empty for a program with calls, whose code is linked at run time.)
+		auto result = CompileThroughStore(
+		    std::move(translated), options, specialization, push_data_start_dword, code,
+		    [&](const std::vector<uint32_t>& spirv) {
+			    return ValidateShaderSpirv(options.dump_label, options.shader_hash, spirv,
+			                               options.profile->maintenance8);
+		    });
+		if (result.invalid) {
 			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,
 			     options.shader_hash);
@@ -1378,7 +1430,7 @@ struct PipelineCache::ProgramCache {
 		return {
 		    .function_code  = {function_code.begin(), function_code.end()},
 		    .specialization = std::move(specialization),
-		    .program        = std::move(result.program).TakeCompiledInfo(),
+		    .program        = std::move(result.program),
 		    .handle         = {.id = ++next_shader_id, .module = module, .spirv_hash = spirv_hash},
 		    .spirv_hash     = spirv_hash,
 		};
@@ -1884,7 +1936,8 @@ struct PipelineCache::ProgramCache {
 		}
 		entry->second.permutations.push_back(CompilePermutation(
 		    stage_name, options, std::move(translated), std::move(specialization), push_data_cursor,
-		    entry->second.FunctionCode()));
+		    entry->second.FunctionCode(),
+		    entry->second.call_source ? std::span<const uint32_t> {} : params.code));
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			if (manifest != nullptr && !entry->second.call_source) {
 				auto& added = entry->second.permutations.back();
@@ -2152,7 +2205,7 @@ PrecompileOutcome PrecompileComputeProgram(GraphicContext& graphics, vk::Pipelin
 	options.input_info.compute = &input;
 	options.wave_size          = input.wave_size;
 
-	const auto compile = [&]() -> std::optional<ShaderRecompiler::CompileResult> {
+	const auto compile = [&]() -> std::optional<StoredCompile> {
 		auto source = ShaderRecompiler::PrepareShaderSource(*record.code, options);
 		if (!source.calls.empty() || source.unsupported_call_pc != UINT32_MAX) {
 			return std::nullopt;
@@ -2166,10 +2219,15 @@ PrecompileOutcome PrecompileComputeProgram(GraphicContext& graphics, vk::Pipelin
 		    !ShaderRecompiler::IR::SpecializationApplies(translated.program, *specialization)) {
 			return std::nullopt;
 		}
-		return ShaderRecompiler::CompileProgram(std::move(translated), options, *specialization,
-		                                        record.push_data_cursor);
+		return CompileThroughStore(std::move(translated), options, *specialization,
+		                           record.push_data_cursor, *record.code,
+		                           [&](const std::vector<uint32_t>& spirv) {
+			                           return ValidateShaderSpirv(options.dump_label,
+			                                                      record.shader_hash, spirv,
+			                                                      profile.maintenance8);
+		                           });
 	};
-	std::optional<ShaderRecompiler::CompileResult> result;
+	std::optional<StoredCompile> result;
 	// A created shader no dispatch has used may never be used: its module stays out of the
 	// simplification store, which every session reads whole.
 	std::optional<ShaderRecompiler::Spirv::SimplifiedStoreBypass> unstored;
@@ -2186,8 +2244,7 @@ PrecompileOutcome PrecompileComputeProgram(GraphicContext& graphics, vk::Pipelin
 		                 code_only ? "created" : "recorded", record.shader_hash, fatal.message);
 		return PrecompileOutcome::Skipped;
 	}
-	if (!result.has_value() || !ValidateShaderSpirv(options.dump_label, record.shader_hash,
-	                                                result->spirv, profile.maintenance8)) {
+	if (!result.has_value() || result->invalid) {
 		return PrecompileOutcome::Skipped;
 	}
 	const auto module_hash =
@@ -2202,7 +2259,7 @@ PrecompileOutcome PrecompileComputeProgram(GraphicContext& graphics, vk::Pipelin
 	if (module == nullptr) {
 		return PrecompileOutcome::Skipped;
 	}
-	const auto                             program = std::move(result->program).TakeCompiledInfo();
+	const auto                             program = std::move(result->program);
 	ShaderRecompiler::IR::ResourceSnapshot resources;
 	const ShaderProgram                    handle {.module = module, .spirv_hash = module_hash};
 	input.stage = {.program = &program, .resources = &resources, .handle = &handle};
@@ -2287,7 +2344,7 @@ bool PipelineCache::TranslateRecordedStage(GraphicContext&            graphics,
 		}
 		options.dump_label = "Precompile VS";
 	}
-	std::optional<ShaderRecompiler::CompileResult> result;
+	std::optional<StoredCompile> result;
 	// No draw has used the shader of a code-only stage, and it may never be used: its module
 	// stays out of the simplification store, which every session reads whole.
 	std::optional<ShaderRecompiler::Spirv::SimplifiedStoreBypass> unstored;
@@ -2310,8 +2367,13 @@ bool PipelineCache::TranslateRecordedStage(GraphicContext&            graphics,
 		if (!ShaderRecompiler::IR::SpecializationApplies(translated.program, specialization)) {
 			return false;
 		}
-		result = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization,
-		                                          record.push_data_cursor);
+		result = CompileThroughStore(std::move(translated), options, specialization,
+		                             record.push_data_cursor, *record.code,
+		                             [&](const std::vector<uint32_t>& spirv) {
+			                             return ValidateShaderSpirv(options.dump_label,
+			                                                        record.shader_hash, spirv,
+			                                                        profile.maintenance8);
+		                             });
 	} catch (const Common::RecoverableFatal& fatal) {
 		if (!record.code_only) {
 			PipelineCacheLog("Precompile: recorded stage {:016x} cannot be translated: {}",
@@ -2319,15 +2381,14 @@ bool PipelineCache::TranslateRecordedStage(GraphicContext&            graphics,
 		}
 		return false;
 	}
-	if (!ValidateShaderSpirv(options.dump_label, record.shader_hash, result->spirv,
-	                         profile.maintenance8)) {
+	if (result->invalid) {
 		return false;
 	}
 	out.module = CompileSPV(result->spirv, graphics.device);
 	if (out.module == nullptr) {
 		return false;
 	}
-	out.program.emplace(std::move(result->program).TakeCompiledInfo());
+	out.program.emplace(std::move(result->program));
 	out.handle = {.id     = ++next_id,
 	              .module = out.module,
 	              .spirv_hash =
@@ -2685,6 +2746,7 @@ PipelineCache::~PipelineCache() {
 	StopBackgroundCompiles();
 	(void)Save();
 	ShaderRecompiler::Spirv::SetSimplifiedStore(nullptr);
+	SetModuleStore(nullptr, 0);
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
 			(void)key;
@@ -2863,6 +2925,17 @@ void PipelineCache::InitializeDriverCache() {
 		    KYTY_GIT_VERSION);
 		ShaderRecompiler::Spirv::SetSimplifiedStore(m_simplified_store.get());
 		PipelineCacheLog("SPIR-V simplifications: {} stored", m_simplified_store->Loaded());
+	}
+	// The modules themselves, so that what a session (or the pass before play) compiled is not
+	// compiled again by the next one. A build's compiler may differ from another's: the file of
+	// another build is replaced.
+	m_module_store = std::make_unique<ModuleStore>(
+	    std::filesystem::path("_PipelineCache") / (title_id + ".v1.modules"), ModuleStoreBuild());
+	SetModuleStore(m_module_store.get(), ModuleVariant(m_graphics));
+	{
+		const auto counts = m_module_store->GetCounts();
+		PipelineCacheLog("Compiled modules: {} stored ({} MiB)", counts.loaded,
+		                 counts.file_bytes >> 20u);
 	}
 	const auto path         = Common::PathToString(m_driver_cache_path);
 	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
@@ -4206,6 +4279,13 @@ bool PipelineCache::Save() {
 	LogCoverage();
 	if (m_simplified_store != nullptr) {
 		m_simplified_store->Flush();
+	}
+	if (m_module_store != nullptr) {
+		m_module_store->Flush();
+		const auto counts = m_module_store->GetCounts();
+		PipelineCacheLog("Compiled modules: {} taken from the store, {} compiled and kept, {} "
+		                 "damaged; {} MiB stored",
+		                 counts.found, counts.inserted, counts.damaged, counts.file_bytes >> 20u);
 	}
 	m_driver_cache_writer.Wait();
 	PersistStaleMisses();

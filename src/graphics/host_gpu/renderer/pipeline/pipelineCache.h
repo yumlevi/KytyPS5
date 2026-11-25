@@ -40,6 +40,7 @@ namespace Libs::Graphics {
 struct GraphicContext;
 class CommandBuffer;
 class CommandScheduler;
+class ModuleStore;
 class ResourceLookahead;
 
 namespace ShaderRecompiler::IR {
@@ -333,6 +334,9 @@ private:
 	// Driver simplifications of SPIR-V kept across sessions; destroyed after the program cache,
 	// whose helper threads translate too.
 	std::unique_ptr<ShaderRecompiler::Spirv::SimplifiedStore> m_simplified_store;
+	// Compiled modules kept across sessions (ModuleStore, storedModules.h); destroyed after the
+	// program cache as well.
+	std::unique_ptr<ModuleStore>                              m_module_store;
 	std::unique_ptr<ProgramCache>                             m_program_cache;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
