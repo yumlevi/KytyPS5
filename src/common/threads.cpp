@@ -165,9 +165,10 @@ void Thread::RaiseCurrentThreadPriority() {
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-// The logical CPUs (bit n: CPU n) of the fastest core class the process may use, without the
-// core that CPU 0 belongs to; 0 when the CPU has one class only or the classes are unknown.
-static DWORD_PTR PerformanceCpuMask() {
+// The logical CPUs (bit n: CPU n) the process may use of the fastest core class, without the
+// core that CPU 0 belongs to, or (`performance` false) of every slower class; 0 when the CPU
+// has one class only or the classes are unknown.
+static DWORD_PTR CoreClassCpuMask(bool performance) {
 	DWORD_PTR process = 0;
 	DWORD_PTR system  = 0;
 	if (GetProcessAffinityMask(GetCurrentProcess(), &process, &system) == 0) {
@@ -210,13 +211,30 @@ static DWORD_PTR PerformanceCpuMask() {
 	}
 	DWORD_PTR mask = 0;
 	for_each([&](const auto& cpu) {
-		if (cpu.EfficiencyClass == fastest && cpu.CoreIndex != interrupt_core) {
+		if (performance ? cpu.EfficiencyClass == fastest && cpu.CoreIndex != interrupt_core
+		                : cpu.EfficiencyClass != fastest) {
 			mask |= DWORD_PTR {1} << cpu.LogicalProcessorIndex;
 		}
 	});
 	return mask;
 }
 #endif
+
+bool Thread::PinCurrentThreadToEfficiencyCpus() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	static const DWORD_PTR mask = [] {
+		const auto cpus  = CoreClassCpuMask(false);
+		int        count = 0;
+		for (auto rest = cpus; rest != 0; rest &= rest - 1) {
+			count++;
+		}
+		return count >= 8 ? cpus : DWORD_PTR {0};
+	}();
+	return mask != 0 && SetThreadAffinityMask(GetCurrentThread(), mask) != 0;
+#else
+	return false;
+#endif
+}
 
 bool Thread::PinCurrentThreadToCpus(const char* list) {
 	if (list == nullptr || *list == '\0') {
@@ -225,7 +243,7 @@ bool Thread::PinCurrentThreadToCpus(const char* list) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	DWORD_PTR mask = 0;
 	if (std::strcmp(list, "auto") == 0) {
-		mask = PerformanceCpuMask();
+		mask = CoreClassCpuMask(true);
 	} else {
 		// "a,b,c-d".
 		for (const char* text = list; *text != '\0';) {

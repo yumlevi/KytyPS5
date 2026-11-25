@@ -18,7 +18,8 @@ PipelineCompileQueue::PipelineCompileQueue(uint32_t thread_count, Discard discar
 	EXIT_IF(thread_count == 0 || !discard);
 	m_state->discard      = std::move(discard);
 	m_state->active       = thread_count;
-	m_state->low_priority = options.low_priority;
+	m_state->low_priority    = options.low_priority;
+	m_state->efficiency_cpus = options.efficiency_cpus;
 	std::lock_guard lock(m_state->mutex);
 	for (uint32_t i = 0; i < thread_count; i++) {
 		Spawn(m_state);
@@ -219,6 +220,9 @@ void PipelineCompileQueue::Worker(const std::shared_ptr<State>& state_ptr, uint6
 	auto& state = *state_ptr;
 	if (state.low_priority) {
 		Common::Thread::LowerCurrentThreadPriority();
+	}
+	if (state.efficiency_cpus) {
+		(void)Common::Thread::PinCurrentThreadToEfficiencyCpus();
 	}
 	for (;;) {
 		Job      job;

@@ -127,8 +127,10 @@ class ProgramPrecompileQueue {
 public:
 	using Job = Common::UniqueFunction<void>;
 
-	explicit ProgramPrecompileQueue(uint32_t thread_count, bool low_priority = false)
-	    : m_queue(thread_count, [](uint64_t) {}, {.low_priority = low_priority}) {}
+	explicit ProgramPrecompileQueue(uint32_t thread_count, bool low_priority = false,
+	                                bool efficiency_cpus = false)
+	    : m_queue(thread_count, [](uint64_t) {},
+	              {.low_priority = low_priority, .efficiency_cpus = efficiency_cpus}) {}
 	~ProgramPrecompileQueue() { Stop(); }
 	KYTY_CLASS_NO_COPY(ProgramPrecompileQueue);
 

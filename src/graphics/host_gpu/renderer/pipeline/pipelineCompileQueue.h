@@ -37,6 +37,9 @@ public:
 	struct Options {
 		// Workers run below normal priority, so that the threads that drive the guest come first.
 		bool low_priority = false;
+		// Workers keep to the efficiency cores where the processor has them
+		// (Thread::PinCurrentThreadToEfficiencyCpus).
+		bool efficiency_cpus = false;
 	};
 
 	PipelineCompileQueue(uint32_t thread_count, Discard discard);
@@ -101,6 +104,7 @@ private:
 		uint32_t busy         = 0;
 		bool     stopped      = false;
 		bool     low_priority = false;
+		bool     efficiency_cpus = false;
 		// Worker threads by id; an abandoned worker is detached and removed.
 		std::unordered_map<uint64_t, std::thread> threads;
 		uint64_t                                  next_worker = 0;

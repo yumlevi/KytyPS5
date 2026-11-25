@@ -36,6 +36,12 @@ uint32_t AvailableProcessors();
 // without the core of CPU 0, which serves most interrupts. False when nothing was changed (an
 // empty or unusable list, a CPU without core classes, or a platform that refuses).
 bool PinCurrentThreadToCpus(const char* list);
+// Keeps the calling thread on the efficiency cores of a processor with two kinds of cores, for
+// work beside the game that may take its time: the performance cores stay with the game's
+// threads and the threads that feed the GPU. False, nothing changed, on a processor with one
+// kind of core, with fewer than eight efficiency CPUs (the work would crowd them), or where the
+// platform refuses.
+bool PinCurrentThreadToEfficiencyCpus();
 
 } // namespace Thread
 

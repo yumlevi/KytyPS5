@@ -79,6 +79,24 @@ Common::LiveControl::Switch g_warm_pipelines("warm_pipelines", 1);
 Common::LiveControl::Switch g_prepare_created("prepare_created", 2);
 constexpr uint64_t          PrepareCreatedMemoryMiB = 40ull * 1024;
 constexpr uint64_t          PrepareCreatedCommitMiB = 28ull * 1024;
+// 1: on a processor with performance and efficiency cores, the threads that translate programs
+// ahead and build pipelines beside the game stay on the efficiency cores
+// (Thread::PinCurrentThreadToEfficiencyCpus); 0: the scheduler places them, as before. They
+// run below normal priority, but sixteen of them are busy for the first minute and a half of a
+// session (Saros: 20,000 translations, 250 s of CPU time, 218 of them the emission of the
+// SPIR-V), and a thread of low priority still takes the second logical CPU of a core the
+// thread that feeds the GPU runs on. Read when a thread starts.
+//
+// What that work costs the game, a replay of a session in Saros by ten-second windows from the
+// level's start (three runs each): placed by the scheduler 39-42, 44-46, 40-42 fps and then,
+// the work done, 51-54; on the efficiency cores 48-50, 52, 45 and, the work lasting half a
+// minute longer, 44-48 where the others had finished; without the work (prepare_created 0)
+// 55, 56, 48, 50, 53. So the cores make the dip half as deep and as much longer: the frames of
+// the first minute come to the same. Half the threads for the shaders no session has used
+// (the Demon's Souls fork's prefetch does that) made it shallower and longer again, the frame
+// rate 3 lower for the whole two minutes, and is not kept. The cost is the work, wherever and
+// however fast it runs; what removes it is not doing it again every session.
+Common::LiveControl::Switch g_background_ecores("background_ecores", 1);
 // 1: a compute dispatch that a module reading its formats at run time serves (a shader's
 // code-only module, which the precompile built for every shader of the game) gets the module of
 // its own formats translated and its pipeline built in the background, and later dispatches
@@ -818,6 +836,9 @@ struct PipelineCache::ProgramCache {
 
 	void PreparationWorker() {
 		Common::Thread::LowerCurrentThreadPriority();
+		if (g_background_ecores.On()) {
+			(void)Common::Thread::PinCurrentThreadToEfficiencyCpus();
+		}
 		auto&            state = *preparation;
 		std::unique_lock lock(state.mutex);
 		for (;;) {
@@ -3711,9 +3732,11 @@ uint64_t PipelineCache::QueueShaderPairs(uint64_t& finished_before) {
 void PipelineCache::QueuePrecompile(uint32_t thread_count) {
 	EXIT_IF(thread_count == 0);
 	if (m_precompile_queue == nullptr) {
-		// Next to a running guest the builds yield to it; the pass by itself takes nearly every
+		// Next to a running guest the builds yield to it, and keep to the efficiency cores where
+		// the processor has them (background_ecores); the pass by itself takes nearly every
 		// CPU, and yields to whatever else the PC is used for meanwhile.
-		m_precompile_queue = std::make_unique<ProgramPrecompileQueue>(thread_count, true);
+		m_precompile_queue = std::make_unique<ProgramPrecompileQueue>(
+		    thread_count, true, !m_precompile_only && g_background_ecores.On());
 	}
 	auto&           progress = m_precompile_progress;
 	std::lock_guard lock(m_list_mutex);
