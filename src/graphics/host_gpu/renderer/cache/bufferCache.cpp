@@ -2529,6 +2529,68 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	dst->Fill(dst_offset, size, value);
 }
 
+// 1: what StoreWords stores over GPU-written bytes goes into guest memory as well, and those
+// bytes stop counting as GPU-written; 0: into the buffer alone.
+//
+// The bytes of such a store are known here, so nothing has to be fetched for them: stored into
+// the buffer they are where the GPU's later work reads them, and stored into guest memory (through
+// the backing: the page keeps its protection, its other bytes are still the GPU's alone) they
+// are where the host reads them. Saros writes a record of 56 dwords once a frame into a page a
+// compute pass wrote just before, and the next dispatch's shader takes its tables from that
+// record: stored into guest memory alone the page was fetched from the GPU first, a wait of this
+// thread for everything the GPU had queued; stored into the buffer alone the walk of that
+// dispatch waited for the record instead (walks that waited 2.0 -> 2.9 a frame, the waits
+// longer: the first one of a run takes the GPU's whole queue).
+//
+// Only while every page of the store keeps other GPU-written bytes: a page left with none
+// would have to become the guest's, with its protection. Such a store stays in the buffer alone.
+static Common::LiveControl::Switch  g_store_both("store_both", 1);
+static Common::LiveControl::Counter g_store_both_stores("store_both_stores");
+static Common::LiveControl::Counter g_store_gpu_only("store_gpu_only");
+
+bool BufferCache::StoreWords(uint64_t vaddr, std::span<const uint32_t> words) {
+	const auto size = words.size_bytes();
+	if (vaddr == 0 || (vaddr & 3u) != 0 || size == 0 || size > UINT64_MAX - vaddr) {
+		EXIT("BufferCache: invalid store range\n");
+	}
+	LibKernel::Memory::SettleLabelAccess(vaddr, size);
+	(void)m_texture_cache.ClearMetaByWrite(vaddr, size);
+	if (!IsRegionGpuModified(vaddr, size)) {
+		// (As FillBuffer: what the write faults of the guest mapping would do.)
+		(void)m_scheduler.Context().InvalidateMemory(vaddr, size);
+		std::memcpy(reinterpret_cast<void*>(vaddr), words.data(), size);
+		return true;
+	}
+	m_texture_cache.PrepareGpuBufferWrite(vaddr, size, TextureCache::BufferWriteExtent::Exact);
+	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
+	// (Marks the bytes GPU-written, moves the epoch of their hot pages, so that a download on
+	// its way is not published over what follows, and waits out a publication under way.)
+	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
+	// (The stream buffer may end the command buffer to make room: the copy goes into the one
+	// that is current afterwards. The written buffer takes its tick at the next boundary.)
+	const auto source = m_stream_buffer.Copy(words.data(), size, sizeof(uint32_t));
+	dst->CopyFrom(m_scheduler.Current(), m_stream_buffer, source, dst_offset, size);
+	if (!g_store_both.On()) {
+		return false;
+	}
+	// Each page of the store keeps GPU-written bytes beside it (before the range or after it).
+	const auto end = vaddr + size;
+	for (auto page = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE); page < end;
+	     page += TRACKER_PAGE_SIZE) {
+		const auto page_end = page + TRACKER_PAGE_SIZE;
+		const bool before   = vaddr > page && m_gpu_modified_ranges.Intersects(page, vaddr - page);
+		const bool after    = end < page_end && m_gpu_modified_ranges.Intersects(end, page_end - end);
+		if (!before && !after) {
+			g_store_gpu_only.Add();
+			return false;
+		}
+	}
+	LibKernel::Memory::WriteBacking(vaddr, words.data(), size);
+	m_gpu_modified_ranges.Subtract(vaddr, size);
+	g_store_both_stores.Add();
+	return true;
+}
+
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
                              bool src_gds) {
 	if (!dst_gds) {

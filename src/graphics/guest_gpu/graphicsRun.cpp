@@ -329,11 +329,20 @@ void CommandProcessor::MemSemaphore(uint64_t* counter, bool signal, bool write) 
 	}
 }
 
-// 1: a WRITE_DATA of a few dwords over bytes the GPU wrote is stored on the GPU's side
-// (BufferCache::FillBuffer); 0: into guest memory, after the page was fetched back.
+// 1: a WRITE_DATA over bytes the GPU wrote is stored on the GPU's side, and into guest memory
+// too where that can be (BufferCache::StoreWords); 0: into guest memory, after the page was
+// fetched back. write_data_gpu_words: the most dwords stored that way (4: only the few, as
+// it was at first).
 static Common::LiveControl::Switch  g_write_data_gpu("write_data_gpu", 1);
+static Common::LiveControl::Switch  g_write_data_gpu_words("write_data_gpu_words", 1024);
 static Common::LiveControl::Counter g_write_data_gpu_stores("write_data_gpu_stores");
-static constexpr uint32_t           MaxGpuStoredWords = 4;
+// Dwords of WRITE_DATA packets a frame; the packets that stored into guest memory although some
+// of their bytes were the GPU's (a wait for the GPU each); and, settle_log 1, a line for each.
+static Common::LiveControl::Counter g_write_data_words("write_data_words");
+static Common::LiveControl::Counter g_write_data_fetched("write_data_fetched");
+static constexpr uint32_t           FilledWords = 4;
+// 1: a line for each packet read or store that found bytes the GPU still wrote.
+static Common::LiveControl::Switch  g_settle_log("settle_log", 0);
 
 void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num,
                                  uint32_t write_control) {
@@ -360,16 +369,31 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	// the GPU's other writes of the page. Stored into guest memory here, the page had to be
 	// fetched back from the GPU first (it is uploaded whole afterwards), and this thread waited
 	// for everything the GPU had queued: 0.4 to 5 ms a frame, 87 ms in a frame with a backlog.
-	if (g_write_data_gpu.On() && !write_one_address && dw_num <= MaxGpuStoredWords &&
-	    (reinterpret_cast<uint64_t>(dst) & 3u) == 0) {
-		auto&      buffer_cache = m_renderer.GetBufferCache();
-		const auto address      = reinterpret_cast<uint64_t>(dst);
+	// The same for a longer store: Saros writes a record of 56 dwords once a frame into a page
+	// a compute pass wrote just before, whose download was still on its way: this thread waited
+	// for that submission, 0.85 times a frame.
+	g_write_data_words.Add(dw_num);
+	auto&      buffer_cache = m_renderer.GetBufferCache();
+	const auto address      = reinterpret_cast<uint64_t>(dst);
+	if (g_write_data_gpu.On() && !write_one_address &&
+	    dw_num <= std::max(g_write_data_gpu_words.Get(), FilledWords) && (address & 3u) == 0) {
 		if (buffer_cache.HasOnlyGpuDirtyBytes(address, bytes)) {
-			for (uint32_t i = 0; i < dw_num; i++) {
-				buffer_cache.FillBuffer(address + uint64_t {i} * sizeof(uint32_t), sizeof(uint32_t), src[i], false);
-			}
+			const bool both = buffer_cache.StoreWords(address, {src, dw_num});
 			g_write_data_gpu_stores.Add();
+			if (g_settle_log.On()) {
+				LOGF("Write data: 0x%" PRIx64 " %u dwords, stored %s, first 0x%08" PRIx32 "\n", address,
+				     dw_num, both ? "on both sides" : "in the buffer alone", src[0]);
+			}
 			return;
+		}
+	}
+	if (Common::LiveControl::Active() && buffer_cache.HasGpuDirtyBytes(address, bytes)) {
+		g_write_data_fetched.Add();
+		if (g_settle_log.On()) {
+			LOGF("Write data: 0x%" PRIx64 " %u dwords%s, fetched: %s\n", address, dw_num,
+			     write_one_address ? " to one address" : "",
+			     buffer_cache.HasOnlyGpuDirtyBytes(address, bytes) ? "all its bytes are the GPU's"
+			                                                      : "some of its bytes are the GPU's");
 		}
 	}
 	// What a write fault would do, without taking one: the caches stop watching the bytes.

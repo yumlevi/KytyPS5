@@ -129,6 +129,12 @@ public:
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ReadGuestBytesForImage(uint64_t vaddr,
 	                                                                  uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
+	// Stores dwords at a dword-aligned guest address as a GPU command would: into guest memory
+	// where no recorded GPU work holds the bytes, else into the buffer that holds them, in the
+	// order of the commands recorded so far (one copy from the stream buffer), and into guest
+	// memory as well where that leaves the tracking state whole (see store_both). Returns
+	// whether guest memory holds the stored bytes now.
+	bool StoreWords(uint64_t vaddr, std::span<const uint32_t> words);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.

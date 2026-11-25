@@ -4856,6 +4856,65 @@ public:
             "write invalidation without a remaining copy did not establish CPU "
             "ownership");
 
+    // A store of several dwords over GPU-written bytes (a longer WRITE_DATA)
+    // lands in the buffer that holds them, in command order and without a
+    // download, and in guest memory too: the stored bytes read from the
+    // backing at once and are no longer waited for, the bytes beside them are
+    // still the GPU's, and a readback brings those. Over bytes no GPU work
+    // holds it is a store into guest memory.
+    constexpr uint64_t store_address = fault_base + 0x7000;
+    constexpr uint64_t clean_store_address = fault_base + 0x9000;
+    constexpr uint32_t store_fill = 0x1f1f1f1fu;
+    constexpr std::array<uint32_t, 5> store_words{
+        0xa0000001u, 0xa0000002u, 0xa0000003u, 0xa0000004u, 0xa0000005u};
+    std::array<uint32_t, 7> stored{};
+    std::array<uint32_t, 5> clean_stored{};
+    std::array<uint32_t, 5> store_backing{};
+    bool store_dirty = false;
+    bool store_both = false;
+    bool store_alone = true;
+    gpu.SendCommandSync([&] {
+      (void)buffer_cache.ObtainBuffer(store_address, sizeof(stored), true,
+                                      false);
+      buffer_cache.FillBuffer(store_address, sizeof(stored), store_fill, false);
+      store_dirty =
+          buffer_cache.HasOnlyGpuDirtyBytes(store_address, sizeof(stored));
+      store_both = buffer_cache.StoreWords(store_address + sizeof(uint32_t),
+                                           store_words) &&
+                   !buffer_cache.HasGpuDirtyBytes(
+                       store_address + sizeof(uint32_t), sizeof(store_words)) &&
+                   buffer_cache.HasOnlyGpuDirtyBytes(store_address,
+                                                     sizeof(uint32_t)) &&
+                   Libs::LibKernel::Memory::TryReadBacking(
+                       store_address + sizeof(uint32_t), store_backing.data(),
+                       sizeof(store_backing));
+      // (A store that would leave its page without GPU-written bytes stays
+      // in the buffer alone.)
+      buffer_cache.ReadMemory(store_address, sizeof(stored));
+      (void)buffer_cache.ObtainBuffer(store_address, sizeof(store_words), true,
+                                      false);
+      store_alone = buffer_cache.StoreWords(store_address, store_words);
+      buffer_cache.ReadMemory(store_address, sizeof(stored));
+      buffer_cache.StoreWords(clean_store_address, store_words);
+    });
+    std::memcpy(stored.data(), reinterpret_cast<const void *>(store_address),
+                sizeof(stored));
+    std::memcpy(clean_stored.data(),
+                reinterpret_cast<const void *>(clean_store_address),
+                sizeof(clean_stored));
+    Require("GpuCommandLane", "store over GPU-written bytes",
+            store_dirty && store_both && store_backing == store_words &&
+                !store_alone &&
+                stored == std::array<uint32_t, 7>{0xa0000001u, 0xa0000002u,
+                                                  0xa0000003u, 0xa0000004u,
+                                                  0xa0000005u, 0xa0000005u,
+                                                  store_fill} &&
+                clean_stored == store_words &&
+                !buffer_cache.HasGpuDirtyBytes(clean_store_address,
+                                               sizeof(clean_stored)),
+            "a store of several dwords did not land over the GPU's bytes in "
+            "command order, or did not reach clean guest memory");
+
     // A RELEASE_MEM label beside GPU-written bytes lands without downloading
     // them; one over GPU-written bytes downloads them first, and one on a clean
     // cached page leaves it CPU-modified for the next upload.
