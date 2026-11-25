@@ -329,6 +329,12 @@ void CommandProcessor::MemSemaphore(uint64_t* counter, bool signal, bool write) 
 	}
 }
 
+// 1: a WRITE_DATA of a few dwords over bytes the GPU wrote is stored on the GPU's side
+// (BufferCache::FillBuffer); 0: into guest memory, after the page was fetched back.
+static Common::LiveControl::Switch  g_write_data_gpu("write_data_gpu", 1);
+static Common::LiveControl::Counter g_write_data_gpu_stores("write_data_gpu_stores");
+static constexpr uint32_t           MaxGpuStoredWords = 4;
+
 void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num,
                                  uint32_t write_control) {
 	const uint32_t dst_sel = ((write_control >> 30u) & 0x1u) | ((write_control >> 7u) & 0x1eu);
@@ -348,6 +354,24 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 
 	const uint64_t bytes = (write_one_address ? 1u : dw_num) * sizeof(uint32_t);
 	SettleLabelAccess(dst, bytes);
+	// A store over bytes the GPU wrote (in Saros one dword, once or twice a frame: a value a
+	// compute pass leaves and the command stream sets again) is the GPU's own in the order of
+	// its commands: written into the buffer that holds the bytes, it reaches guest memory with
+	// the GPU's other writes of the page. Stored into guest memory here, the page had to be
+	// fetched back from the GPU first (it is uploaded whole afterwards), and this thread waited
+	// for everything the GPU had queued: 0.4 to 5 ms a frame, 87 ms in a frame with a backlog.
+	if (g_write_data_gpu.On() && !write_one_address && dw_num <= MaxGpuStoredWords &&
+	    (reinterpret_cast<uint64_t>(dst) & 3u) == 0) {
+		auto&      buffer_cache = m_renderer.GetBufferCache();
+		const auto address      = reinterpret_cast<uint64_t>(dst);
+		if (buffer_cache.HasOnlyGpuDirtyBytes(address, bytes)) {
+			for (uint32_t i = 0; i < dw_num; i++) {
+				buffer_cache.FillBuffer(address + uint64_t {i} * sizeof(uint32_t), sizeof(uint32_t), src[i], false);
+			}
+			g_write_data_gpu_stores.Add();
+			return;
+		}
+	}
 	// What a write fault would do, without taking one: the caches stop watching the bytes.
 	(void)m_renderer.InvalidateMemory(reinterpret_cast<uint64_t>(dst), bytes);
 	// Completion labels can be reused immediately; memcpy may write a destination twice.
